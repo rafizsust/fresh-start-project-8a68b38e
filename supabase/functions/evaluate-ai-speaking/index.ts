@@ -12,6 +12,7 @@ import {
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
 function stableHashHex(input: string): string {
@@ -206,7 +207,7 @@ serve(async (req) => {
   console.log(`[evaluate-ai-speaking] Request received at ${new Date().toISOString()}`);
   
   if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
+    return new Response(null, { status: 204, headers: corsHeaders });
   }
 
   try {
@@ -1012,24 +1013,15 @@ Band 0: No speech detected
 6. DO NOT inflate scores. Most candidates score between 5.0-7.0. Band 8+ is rare and requires exceptional performance.
 7. Apply the SAME standard whether evaluating a single part or the full test.
 
-=== MODEL ANSWERS ===
-Provide FOUR model answers for EVERY question - at Band 6, 7, 8, and 9 levels:
-- candidateResponse: What the candidate actually said (transcription)
-- modelAnswerBand6: A Band 6 response showing competent but limited language use
-- modelAnswerBand7: A solid Band 7 response that is good but has minor limitations
-- modelAnswerBand8: An exemplary Band 8 response with sophisticated language
-- modelAnswerBand9: A near-native Band 9 response with exceptional fluency and precision
-- whyBand6Works: Array of reasons why this Band 6 answer is effective at that level
-- whyBand7Works: Array of reasons why this Band 7 answer is effective at that level
-- whyBand8Works: Array of reasons why this Band 8 answer is effective at that level
-- whyBand9Works: Array of reasons why this Band 9 answer is effective at that level
+=== MODEL ANSWERS (COMPACT) ===
+For each question, provide FOUR short model answers at Band 6, 7, 8, and 9 levels.
+To avoid truncated JSON responses, keep answers concise:
+- Part 1 model answers: 25–45 words
+- Part 2 model answers: 90–140 words
+- Part 3 model answers: 60–90 words
 
-MANDATORY WORD COUNT REQUIREMENTS FOR MODEL ANSWERS (STRICT - REGARDLESS OF CANDIDATE RESPONSE LENGTH):
-- Part 1 model answers: 60-85 words per question (natural, conversational with personal examples)
-- Part 2 model answers: 260-340 words (comprehensive long turn covering all cue card points with detail)
-- Part 3 model answers: 130-170 words per question (in-depth discussion with reasoning and examples)
-These word counts are MINIMUM STANDARDS. Even if the candidate gave a very short or no response, YOUR model answers MUST meet these lengths.
-Model answers should demonstrate ideal IELTS response structure, vocabulary, and fluency for each band level.
+For each band level also include whyBandXWorks (1–2 specific reasons).
+Model answers must be natural and realistic IELTS responses (no bullet lists inside the model answer text).
 
 Respond with JSON in this exact format:
 {
@@ -1052,13 +1044,10 @@ Respond with JSON in this exact format:
   "transcripts": { "part1-q<id>": string, "part2-q<id>": string, "part3-q<id>": string }
 }
 
-CRITICAL MANDATORY REQUIREMENTS FOR MODEL ANSWERS:
-1. The "modelAnswers" array MUST contain an entry for EVERY question from ALL parts - NO EXCEPTIONS.
-2. Each entry MUST include ALL FOUR band levels: modelAnswerBand6, modelAnswerBand7, modelAnswerBand8, modelAnswerBand9.
-3. Each entry MUST include ALL FOUR whyBandXWorks arrays: whyBand6Works, whyBand7Works, whyBand8Works, whyBand9Works.
-4. NEVER skip or omit any band level - all four are MANDATORY for every question.
-5. If any band level is missing, the response will be REJECTED and must be regenerated.
-6. Each whyBandXWorks array should have 2-4 specific reasons.`;
+MODEL ANSWER REQUIREMENTS:
+1. The "modelAnswers" array should contain an entry for every question across all parts.
+2. Keep model answers within the word caps above to prevent truncation.
+3. Each whyBandXWorks array should have 1–2 specific reasons.`;
 }
 
 function normalizeEvaluationResponse(data: any): any {
