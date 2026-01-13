@@ -953,7 +953,7 @@ export default function AIPracticeSpeakingTest() {
       }
 
       setEvaluationStep(2);
-      console.log(`[AIPracticeSpeakingTest] Step 2: Triggering async evaluation (${Object.keys(filePaths).length} files)...`);
+      console.log(`[AIPracticeSpeakingTest] Step 2: Calling sync evaluation (${Object.keys(filePaths).length} files)...`);
 
       // Calculate Part 2 fluency flag
       const part2Duration = Object.entries(segments)
@@ -961,8 +961,8 @@ export default function AIPracticeSpeakingTest() {
         .reduce((acc, [, s]) => acc + (s.duration || 0), 0);
       const fluencyFlag = part2Duration > 0 && part2Duration < PART2_MIN_SPEAKING;
 
-      // STEP 2: Trigger ASYNC evaluation - returns immediately with 202
-      const { data, error } = await supabase.functions.invoke('evaluate-speaking-async', {
+      // STEP 2: Call SYNC evaluation - waits for full result
+      const { data, error } = await supabase.functions.invoke('evaluate-speaking-submission', {
         body: {
           testId,
           filePaths,
@@ -976,13 +976,12 @@ export default function AIPracticeSpeakingTest() {
       if (exitRequestedRef.current || !isMountedRef.current) return;
 
       if (error) {
-        console.error('[AIPracticeSpeakingTest] Async evaluation error:', error);
+        console.error('[AIPracticeSpeakingTest] Sync evaluation error:', error);
         throw new Error(error.message || 'Submission failed');
       }
 
-      // Check for 202 Accepted (async) or success
-      if (data?.success || data?.jobId) {
-        console.log('[AIPracticeSpeakingTest] Submission accepted, jobId:', data.jobId);
+      if (data?.success) {
+        console.log('[AIPracticeSpeakingTest] Evaluation complete, band:', data.overallBand);
         setEvaluationStep(3);
 
         // Delete persisted audio
@@ -993,19 +992,21 @@ export default function AIPracticeSpeakingTest() {
 
         // Show success toast
         toast({
-          title: 'Test Submitted!',
-          description: 'Your results will be ready in a moment.',
+          title: 'Test Evaluated!',
+          description: `Your band score: ${data.overallBand}`,
         });
 
         setPhase('done');
 
-        // Navigate to results page - it will show loading until results are ready
+        // Navigate directly to results page with the result data
         if (!exitRequestedRef.current && isMountedRef.current) {
           await exitFullscreen();
           navigate(`/ai-practice/speaking/results/${testId}`);
         }
       } else if (data?.error) {
         throw new Error(data.error);
+      } else {
+        throw new Error('Unexpected response from evaluation');
       }
 
     } catch (err: any) {
