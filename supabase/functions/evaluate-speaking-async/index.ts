@@ -28,13 +28,39 @@ const GEMINI_MODELS = [
   'gemini-1.5-pro',
 ];
 
-// Exponential backoff for retries
+// Retries are ONLY for transient transport errors.
+// IMPORTANT: If we detect quota exhaustion for a key, we DO NOT retry that key/model again.
 const RETRY_CONFIG = {
-  maxRetries: 5,
-  initialDelayMs: 2000,
-  maxDelayMs: 30000,
+  maxRetries: 2,
+  initialDelayMs: 1500,
+  maxDelayMs: 8000,
   backoffMultiplier: 2,
+  retryableStatuses: [503, 504],
 };
+
+type GeminiErrorKind = 'quota' | 'rate_limit' | 'invalid_key' | 'not_found' | 'other';
+
+function classifyGeminiError(status: number, errText: string): GeminiErrorKind {
+  const lower = (errText || '').toLowerCase();
+  if (status === 404) return 'not_found';
+  if (status === 400 && (lower.includes('api_key') || lower.includes('api key'))) return 'invalid_key';
+
+  // Gemini often returns 429 for both quota exhaustion and rate limiting.
+  // Quota exhaustion usually contains these phrases.
+  const looksLikeQuota =
+    status === 429 &&
+    (lower.includes('exceeded your current quota') ||
+      lower.includes('check your plan') ||
+      lower.includes('billing') ||
+      lower.includes('quota'));
+  if (looksLikeQuota) return 'quota';
+
+  const looksLikeRateLimit =
+    status === 429 && (lower.includes('too many requests') || lower.includes('rate limit') || lower.includes('resource_exhausted'));
+  if (looksLikeRateLimit) return 'rate_limit';
+
+  return 'other';
+}
 
 // Declare EdgeRuntime for background processing
 declare const EdgeRuntime: { waitUntil?: (promise: Promise<void>) => void } | undefined;
@@ -211,21 +237,90 @@ async function runEvaluation(
     }
   }
 
-  // Download audio files from R2
+  // Build a mapping from recorded segment keys (e.g. "part1-q<uuid>") to the test questions.
+  // This is critical so we can return transcripts + model answers for EVERY question.
+  const parts = Array.isArray(payload?.speakingParts) ? payload.speakingParts : [];
+  const questionById = new Map<string, { partNumber: 1 | 2 | 3; questionNumber: number; questionText: string }>();
+  for (const p of parts) {
+    const partNumber = Number(p?.part_number) as 1 | 2 | 3;
+    if (partNumber !== 1 && partNumber !== 2 && partNumber !== 3) continue;
+    const qs = Array.isArray(p?.questions) ? p.questions : [];
+    for (const q of qs) {
+      const id = String(q?.id || '');
+      if (!id) continue;
+      questionById.set(id, {
+        partNumber,
+        questionNumber: Number(q?.question_number),
+        questionText: String(q?.question_text || ''),
+      });
+    }
+  }
+
+  const segmentMetaByKey = new Map<
+    string,
+    { segmentKey: string; partNumber: 1 | 2 | 3; questionNumber: number; questionText: string }
+  >();
+
+  for (const segmentKey of Object.keys(file_paths as Record<string, string>)) {
+    // Expected segmentKey format: part{n}-q{questionId}
+    const m = String(segmentKey).match(/^part([123])\-q(.+)$/);
+    if (!m) continue;
+    const partNumber = Number(m[1]) as 1 | 2 | 3;
+    const questionId = m[2];
+    const q = questionById.get(questionId);
+    if (!q) continue;
+    segmentMetaByKey.set(segmentKey, {
+      segmentKey,
+      partNumber,
+      questionNumber: q.questionNumber,
+      questionText: q.questionText,
+    });
+  }
+
+  const orderedSegments = Array.from(segmentMetaByKey.values()).sort((a, b) => {
+    if (a.partNumber !== b.partNumber) return a.partNumber - b.partNumber;
+    return a.questionNumber - b.questionNumber;
+  });
+
+  // Download audio files from R2 (preserve segmentKey so the model can align audio->question)
   console.log('[runEvaluation] Downloading audio files from R2...');
-  const audioContents: { key: string; data: Uint8Array; mimeType: string }[] = [];
-  
-  for (const [key, path] of Object.entries(file_paths)) {
+  const audioContents: {
+    segmentKey: string;
+    data: Uint8Array;
+    mimeType: string;
+    partNumber: 1 | 2 | 3;
+    questionNumber: number;
+    questionText: string;
+  }[] = [];
+
+  for (const [segmentKey, path] of Object.entries(file_paths)) {
     try {
       const result = await getFromR2(path as string);
       if (result.success && result.bytes) {
         const ext = (path as string).split('.').pop()?.toLowerCase() || 'webm';
         const mimeType = ext === 'mp3' ? 'audio/mpeg' : 'audio/webm';
-        audioContents.push({ key, data: result.bytes, mimeType });
-        console.log(`[runEvaluation] Downloaded: ${key} (${result.bytes.length} bytes)`);
+
+        const meta = segmentMetaByKey.get(segmentKey);
+        // If we cannot map this segment to a question, still include it, but mark unknown.
+        const fallbackMeta = meta ?? {
+          segmentKey,
+          partNumber: 1,
+          questionNumber: 0,
+          questionText: '',
+        };
+
+        audioContents.push({
+          segmentKey,
+          data: result.bytes,
+          mimeType,
+          partNumber: fallbackMeta.partNumber,
+          questionNumber: fallbackMeta.questionNumber,
+          questionText: fallbackMeta.questionText,
+        });
+        console.log(`[runEvaluation] Downloaded: ${segmentKey} (${result.bytes.length} bytes)`);
       }
     } catch (e) {
-      console.error(`[runEvaluation] Download error for ${key}:`, e);
+      console.error(`[runEvaluation] Download error for ${segmentKey}:`, e);
     }
   }
 
@@ -263,27 +358,41 @@ async function runEvaluation(
     throw new Error('No API keys available');
   }
 
-  // Build evaluation prompt
-  const prompt = buildPrompt(payload, topic || testRow.topic, difficulty || testRow.difficulty, fluency_flag);
+  // Build evaluation prompt (includes segment/question mapping so output can be complete)
+  const prompt = buildPrompt(
+    payload,
+    topic || testRow.topic,
+    difficulty || testRow.difficulty,
+    fluency_flag,
+    orderedSegments,
+  );
 
-  // Try evaluation with retries
+  // Evaluate with key/model rotation.
+  // IMPORTANT: If a key is quota-exhausted, we do NOT retry it.
   let result: any = null;
   let usedModel: string | null = null;
-  
+
+  let userKeyWasQuotaLimited = false;
+
   for (const candidate of keyQueue) {
     if (result) break;
-    
+
+    // If user's key hit quota, skip it (we already marked it by flag).
+    if (candidate.isUser && userKeyWasQuotaLimited) continue;
+
     for (const model of GEMINI_MODELS) {
-      // Retry loop with backoff
+      if (result) break;
+
+      // Only retry transient 503/504. Never retry quota exhaustion.
       for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
         try {
           console.log(`[runEvaluation] Trying ${model} (attempt ${attempt + 1})`);
-          
-          const inlineParts = audioContents.map(ac => ({
+
+          const inlineParts = audioContents.map((ac) => ({
             inline_data: {
               mime_type: ac.mimeType,
               data: btoa(String.fromCharCode(...ac.data)),
-            }
+            },
           }));
 
           const response = await fetch(
@@ -293,46 +402,66 @@ async function runEvaluation(
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 contents: [{ role: 'user', parts: [...inlineParts, { text: prompt }] }],
-                generationConfig: { temperature: 0.3, maxOutputTokens: 8000, responseMimeType: 'application/json' },
+                generationConfig: {
+                  temperature: 0.3,
+                  maxOutputTokens: 8000,
+                  responseMimeType: 'application/json',
+                },
               }),
-            }
+            },
           );
 
           console.log(`[runEvaluation] ${model} response: ${response.status}`);
 
           if (!response.ok) {
             const errText = await response.text();
-            console.error(`[runEvaluation] ${model} error:`, errText.slice(0, 200));
-            
-            const errLower = errText.toLowerCase();
-            const isQuota = response.status === 429 || errLower.includes('quota');
-            const isRetryable = response.status === 429 || response.status === 503 || response.status === 504;
-            const isNotFound = response.status === 404;
-            
-            if (isNotFound) {
-              break; // Try next model
+            const kind = classifyGeminiError(response.status, errText);
+            console.error(`[runEvaluation] ${model} error (${kind}):`, errText.slice(0, 220));
+
+            // Model not found: try next model.
+            if (kind === 'not_found') break;
+
+            // Quota: mark pool key exhausted (and stop using it). For user key, switch to pool.
+            if (kind === 'quota') {
+              if (candidate.isUser) {
+                userKeyWasQuotaLimited = true;
+              } else if (candidate.id) {
+                await markKeyQuotaExhausted(supabaseService, candidate.id, 'flash');
+              }
+              // Do NOT retry this key/model.
+              break;
             }
-            
+
+            // Invalid key: stop using this key.
+            if (kind === 'invalid_key') {
+              if (!candidate.isUser && candidate.id) {
+                await markKeyQuotaExhausted(supabaseService, candidate.id, 'flash');
+              }
+              break;
+            }
+
+            // Retry ONLY for transient statuses.
+            const isRetryable = RETRY_CONFIG.retryableStatuses.includes(response.status);
             if (isRetryable && attempt < RETRY_CONFIG.maxRetries) {
               const delay = Math.min(
                 RETRY_CONFIG.initialDelayMs * Math.pow(RETRY_CONFIG.backoffMultiplier, attempt),
-                RETRY_CONFIG.maxDelayMs
+                RETRY_CONFIG.maxDelayMs,
               );
               console.log(`[runEvaluation] Retrying in ${delay}ms...`);
-              await new Promise(r => setTimeout(r, delay));
+              await new Promise((r) => setTimeout(r, delay));
               continue;
             }
-            
-            if (isQuota && candidate.id) {
-              await markKeyQuotaExhausted(supabaseService, candidate.id, 'flash');
-            }
-            
-            break; // Try next model or key
+
+            // Otherwise: try next model (same key).
+            break;
           }
 
           const data = await response.json();
-          const text = data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text).filter(Boolean).join('');
-          
+          const text = data?.candidates?.[0]?.content?.parts
+            ?.map((p: any) => p?.text)
+            .filter(Boolean)
+            .join('');
+
           if (text) {
             result = parseJson(text);
             if (result) {
@@ -341,20 +470,23 @@ async function runEvaluation(
               break;
             }
           }
-          break; // Got response but no valid JSON, try next model
-          
+
+          // Got a response but invalid JSON: try next model.
+          break;
         } catch (err: any) {
-          console.error(`[runEvaluation] Error with ${model}:`, err.message);
+          console.error(`[runEvaluation] Error with ${model}:`, err?.message || String(err));
           if (attempt < RETRY_CONFIG.maxRetries) {
-            await new Promise(r => setTimeout(r, RETRY_CONFIG.initialDelayMs * Math.pow(2, attempt)));
+            const delay = Math.min(
+              RETRY_CONFIG.initialDelayMs * Math.pow(RETRY_CONFIG.backoffMultiplier, attempt),
+              RETRY_CONFIG.maxDelayMs,
+            );
+            await new Promise((r) => setTimeout(r, delay));
             continue;
           }
           break;
         }
       }
-      if (result) break;
     }
-    if (result) break;
   }
 
   if (!result) {
@@ -434,27 +566,45 @@ async function decryptKey(encrypted: string, appKey: string): Promise<string> {
   return decoder.decode(decrypted);
 }
 
-function buildPrompt(payload: any, topic?: string, difficulty?: string, fluencyFlag?: boolean): string {
+function buildPrompt(
+  payload: any,
+  topic: string | undefined,
+  difficulty: string | undefined,
+  fluencyFlag: boolean | undefined,
+  orderedSegments: Array<{ segmentKey: string; partNumber: 1 | 2 | 3; questionNumber: number; questionText: string }>,
+): string {
   const parts = Array.isArray(payload?.speakingParts) ? payload.speakingParts : [];
   const questions = parts
-    .flatMap((p: any) => (Array.isArray(p?.questions) ? p.questions.map((q: any) => ({
-      part_number: Number(p?.part_number),
-      question_number: Number(q?.question_number),
-      question_text: String(q?.question_text || ''),
-    })) : []))
+    .flatMap((p: any) =>
+      (Array.isArray(p?.questions)
+        ? p.questions.map((q: any) => ({
+            id: String(q?.id || ''),
+            part_number: Number(p?.part_number),
+            question_number: Number(q?.question_number),
+            question_text: String(q?.question_text || ''),
+          }))
+        : []),
+    )
     .filter((q: any) => q.part_number === 1 || q.part_number === 2 || q.part_number === 3);
 
   const questionJson = JSON.stringify(questions);
+  const segmentJson = JSON.stringify(orderedSegments);
 
   return [
-    `You are an expert IELTS Speaking examiner.`,
-    `Evaluate the candidate's audio recordings for ALL parts provided.`,
+    `You are a strict, professional IELTS Speaking examiner (2025 criteria).`,
+    `Your job: produce COMPLETE evaluation for EVERY recorded question.`,
     `Topic: ${topic || 'General'}. Difficulty: ${difficulty || 'Medium'}.`,
-    fluencyFlag ? `Important: Part 2 speaking was under 80 seconds; reflect this in Fluency & Coherence feedback.` : null,
+    fluencyFlag
+      ? `Important: Part 2 speaking was under 80 seconds; reflect this in Fluency & Coherence feedback.`
+      : null,
     ``,
-    `You must return STRICT JSON ONLY (no markdown, no backticks).`,
-    `Use this exact schema and key names:`,
+    `CRITICAL OUTPUT RULES:`,
+    `- Return STRICT JSON ONLY (no markdown, no backticks).`,
+    `- You MUST include transcripts + model answers for ALL questions listed in segment_map_json.`,
+    `- If speech is unclear, use "(inaudible)" for missing words but still return an entry.`,
+    `- Keep answers realistic and aligned to band descriptors.`,
     ``,
+    `Return this exact schema and key names:`,
     `{`,
     `  "overall_band": 6.5,`,
     `  "criteria": {`,
@@ -467,23 +617,37 @@ function buildPrompt(payload: any, topic?: string, difficulty?: string, fluencyF
     `  "improvements": ["Top 5 actionable improvements"],`,
     `  "transcripts_by_part": { "1": "...", "2": "...", "3": "..." },`,
     `  "transcripts_by_question": {`,
-    `    "1": [{"question_number": 1, "question_text": "...", "transcript": "..."}],`,
-    `    "2": [{"question_number": 5, "question_text": "...", "transcript": "..."}],`,
-    `    "3": [{"question_number": 9, "question_text": "...", "transcript": "..."}]`,
+    `    "1": [{"segment_key":"part1-q...","question_number":1,"question_text":"...","transcript":"..."}],`,
+    `    "2": [{"segment_key":"part2-q...","question_number":5,"question_text":"...","transcript":"..."}],`,
+    `    "3": [{"segment_key":"part3-q...","question_number":9,"question_text":"...","transcript":"..."}]`,
     `  },`,
     `  "modelAnswers": [{`,
+    `    "segment_key": "part1-q...",`,
     `    "partNumber": 1,`,
+    `    "questionNumber": 1,`,
     `    "question": "...",`,
-    `    "candidateResponse": "...",`,
+    `    "candidateResponse": "(use the transcript)",`,
+    `    "modelAnswerBand6": "...",`,
     `    "modelAnswerBand7": "...",`,
     `    "modelAnswerBand8": "...",`,
-    `    "keyFeatures": ["..."]`,
+    `    "modelAnswerBand9": "...",`,
+    `    "whyBand6Works": ["..."],`,
+    `    "whyBand7Works": ["..."],`,
+    `    "whyBand8Works": ["..."],`,
+    `    "whyBand9Works": ["..."],`,
+    `    "keyFeatures": ["... (optional)" ]`,
     `  }]`,
     `}`,
     ``,
-    `For transcripts: keep them concise but complete; if audio is unclear, write "(inaudible)" for missing words.`,
-    `Use these questions (JSON): ${questionJson}`,
-  ].filter(Boolean).join('\n');
+    `You will receive (JSON):`,
+    `- questions_json: all questions in the test`,
+    `- segment_map_json: the recorded segments you MUST cover (this is the source of truth for completeness)`,
+    ``,
+    `questions_json: ${questionJson}`,
+    `segment_map_json: ${segmentJson}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function parseJson(text: string): any {

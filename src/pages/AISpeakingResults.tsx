@@ -409,19 +409,18 @@ export default function AISpeakingResults() {
               </div>
               
               <h2 className="text-xl font-bold mb-2">
-                {jobStatus === 'processing' ? 'Analyzing Your Speech...' : 'Preparing Evaluation...'}
+                {jobStatus === 'processing' ? 'Analyzing Your Speech…' : 'Submission Received'}
               </h2>
               
               <p className="text-muted-foreground mb-4">
-                {jobStatus === 'processing' 
-                  ? 'AI is evaluating your pronunciation, fluency, and grammar'
-                  : 'Your recordings have been submitted successfully'
-                }
+                {jobStatus === 'processing'
+                  ? 'Your evaluation is being generated in the background. You can leave this page — we’ll notify you when it’s ready.'
+                  : 'Your recordings were submitted successfully. We’re starting the evaluation now.'}
               </p>
 
               <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground mb-4">
                 <Clock className="w-4 h-4" />
-                <span>This typically takes 30-60 seconds</span>
+                <span>Usually 30–90 seconds</span>
               </div>
 
               {retryCount > 0 && (
