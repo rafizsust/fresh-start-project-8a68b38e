@@ -1,14 +1,19 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { GoogleGenerativeAI } from "https://esm.sh/@google/generative-ai@0.21.0";
 import { crypto } from "https://deno.land/std@0.168.0/crypto/mod.ts";
 import { 
   getActiveGeminiKeysForModel, 
-  markKeyQuotaExhausted
+  markKeyQuotaExhausted,
+  isQuotaExhaustedError
 } from "../_shared/apiKeyQuotaUtils.ts";
 import { getFromR2 } from "../_shared/r2Client.ts";
 
 /**
  * ASYNC Speaking Evaluation Edge Function
+ * 
+ * Uses Google File API for audio uploads to avoid base64 token bloat (stack overflow).
+ * Audio files are uploaded to Google's servers, then URIs are passed to Gemini.
  * 
  * Returns 202 Accepted IMMEDIATELY. User gets instant "submitted" feedback.
  * Actual evaluation runs in background via EdgeRuntime.waitUntil.
@@ -21,44 +26,44 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
-// Model priority: gemini-2.5-flash-preview-05-20 only (2.0-flash deprecated, 1.5-pro removed from API)
+// Model priority: gemini-2.5-flash first (best quality), then 2.0-flash fallback
 const GEMINI_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.0-flash',
 ];
 
-// Retries are ONLY for transient transport errors.
-// IMPORTANT: If we detect quota exhaustion for a key, we DO NOT retry that key/model again.
-const RETRY_CONFIG = {
-  maxRetries: 2,
-  initialDelayMs: 1500,
-  maxDelayMs: 8000,
-  backoffMultiplier: 2,
-  retryableStatuses: [503, 504],
-};
+// Custom error class for quota exhaustion / rate limiting
+class QuotaError extends Error {
+  permanent: boolean;
+  retryAfterSeconds?: number;
 
-type GeminiErrorKind = 'quota' | 'rate_limit' | 'invalid_key' | 'not_found' | 'other';
+  constructor(message: string, opts: { permanent: boolean; retryAfterSeconds?: number }) {
+    super(message);
+    this.name = 'QuotaError';
+    this.permanent = opts.permanent;
+    this.retryAfterSeconds = opts.retryAfterSeconds;
+  }
+}
 
-function classifyGeminiError(status: number, errText: string): GeminiErrorKind {
-  const lower = (errText || '').toLowerCase();
-  if (status === 404) return 'not_found';
-  if (status === 400 && (lower.includes('api_key') || lower.includes('api key'))) return 'invalid_key';
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  // Gemini often returns 429 for both quota exhaustion and rate limiting.
-  // Quota exhaustion usually contains these phrases.
-  const looksLikeQuota =
-    status === 429 &&
-    (lower.includes('exceeded your current quota') ||
-      lower.includes('check your plan') ||
-      lower.includes('billing') ||
-      lower.includes('quota'));
-  if (looksLikeQuota) return 'quota';
+function extractRetryAfterSeconds(err: any): number | undefined {
+  const msg = String(err?.message || err || '');
+  const m1 = msg.match(/retryDelay"\s*:\s*"(\d+)s"/i);
+  if (m1) return Math.max(0, Number(m1[1]));
+  const m2 = msg.match(/retry\s+in\s+([0-9.]+)s/i);
+  if (m2) return Math.max(0, Math.ceil(Number(m2[1])));
+  return undefined;
+}
 
-  const looksLikeRateLimit =
-    status === 429 && (lower.includes('too many requests') || lower.includes('rate limit') || lower.includes('resource_exhausted'));
-  if (looksLikeRateLimit) return 'rate_limit';
-
-  return 'other';
+function isPermanentQuotaExhausted(err: any): boolean {
+  const msg = String(err?.message || err || '').toLowerCase();
+  if (msg.includes('check your plan') || msg.includes('billing')) return true;
+  if (msg.includes('limit: 0')) return true;
+  if (msg.includes('per day') && !msg.includes('retry')) return true;
+  return false;
 }
 
 // Declare EdgeRuntime for background processing
@@ -71,6 +76,76 @@ interface EvaluationRequest {
   topic?: string;
   difficulty?: string;
   fluencyFlag?: boolean;
+}
+
+// Upload audio to Google File API using direct HTTP (Deno-compatible)
+async function uploadToGoogleFileAPI(
+  apiKey: string,
+  audioBytes: Uint8Array,
+  fileName: string,
+  mimeType: string
+): Promise<{ uri: string; mimeType: string }> {
+  console.log(`[evaluate-speaking-async] Uploading ${fileName} to Google File API (${audioBytes.length} bytes)...`);
+  
+  // Google File API uses resumable upload protocol
+  const initiateUrl = `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`;
+  
+  const metadata = {
+    file: {
+      displayName: fileName,
+    }
+  };
+  
+  const initiateResponse = await fetch(initiateUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(audioBytes.length),
+      'X-Goog-Upload-Header-Content-Type': mimeType,
+    },
+    body: JSON.stringify(metadata),
+  });
+  
+  if (!initiateResponse.ok) {
+    const errorText = await initiateResponse.text();
+    throw new Error(`Failed to initiate upload: ${initiateResponse.status} - ${errorText}`);
+  }
+  
+  const uploadUrl = initiateResponse.headers.get('X-Goog-Upload-URL');
+  if (!uploadUrl) {
+    throw new Error('No upload URL returned from Google File API');
+  }
+  
+  // Step 2: Upload the actual bytes
+  const uploadResponse = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: {
+      'Content-Length': String(audioBytes.length),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    body: audioBytes.buffer as ArrayBuffer,
+  });
+  
+  if (!uploadResponse.ok) {
+    const errorText = await uploadResponse.text();
+    throw new Error(`Failed to upload file: ${uploadResponse.status} - ${errorText}`);
+  }
+  
+  const result = await uploadResponse.json();
+  
+  if (!result.file?.uri) {
+    throw new Error('No file URI returned from Google File API');
+  }
+  
+  console.log(`[evaluate-speaking-async] Uploaded ${fileName}: ${result.file.uri}`);
+  
+  return {
+    uri: result.file.uri,
+    mimeType: result.file.mimeType || mimeType,
+  };
 }
 
 serve(async (req) => {
@@ -155,10 +230,8 @@ serve(async (req) => {
       }
     };
 
-    // Watchdog: if a job gets stuck in pending/processing (function instance shutdown, etc.),
-    // mark it as failed so the frontend stops polling forever.
+    // Watchdog: if a job gets stuck, mark it as failed
     const watchdog = async () => {
-      // 12 minutes: long enough for normal runs, short enough to avoid “infinite processing”.
       const WATCHDOG_MS = 12 * 60 * 1000;
       await new Promise((r) => setTimeout(r, WATCHDOG_MS));
 
@@ -176,8 +249,7 @@ serve(async (req) => {
         .from('speaking_evaluation_jobs')
         .update({
           status: 'failed',
-          last_error:
-            'Evaluation timed out in background processing. Please resubmit (we will reuse your uploaded audio).',
+          last_error: 'Evaluation timed out in background processing. Please resubmit.',
         })
         .eq('id', job.id);
     };
@@ -241,7 +313,7 @@ async function runEvaluation(
 
   if (!job) throw new Error('Job not found');
 
-  const { test_id, file_paths, durations, topic, difficulty, fluency_flag, retry_count, max_retries } = job;
+  const { test_id, file_paths, durations, topic, difficulty, fluency_flag } = job;
 
   // Get test payload
   const { data: testRow } = await supabaseService
@@ -268,8 +340,7 @@ async function runEvaluation(
     }
   }
 
-  // Build a mapping from recorded segment keys (e.g. "part1-q<uuid>") to the test questions.
-  // This is critical so we can return transcripts + model answers for EVERY question.
+  // Build segment metadata for completeness checking
   const parts = Array.isArray(payload?.speakingParts) ? payload.speakingParts : [];
   const questionById = new Map<string, { partNumber: 1 | 2 | 3; questionNumber: number; questionText: string }>();
   for (const p of parts) {
@@ -293,7 +364,6 @@ async function runEvaluation(
   >();
 
   for (const segmentKey of Object.keys(file_paths as Record<string, string>)) {
-    // Expected segmentKey format: part{n}-q{questionId}
     const m = String(segmentKey).match(/^part([123])\-q(.+)$/);
     if (!m) continue;
     const partNumber = Number(m[1]) as 1 | 2 | 3;
@@ -313,56 +383,44 @@ async function runEvaluation(
     return a.questionNumber - b.questionNumber;
   });
 
-  // Download audio files from R2 (preserve segmentKey so the model can align audio->question)
+  // ============ DOWNLOAD FILES FROM R2 ============
   console.log('[runEvaluation] Downloading audio files from R2...');
-  const audioContents: {
-    segmentKey: string;
-    data: Uint8Array;
-    mimeType: string;
-    partNumber: 1 | 2 | 3;
-    questionNumber: number;
-    questionText: string;
-  }[] = [];
+  const audioFiles: { key: string; bytes: Uint8Array; mimeType: string }[] = [];
 
-  for (const [segmentKey, path] of Object.entries(file_paths)) {
+  for (const [audioKey, r2Path] of Object.entries(file_paths as Record<string, string>)) {
     try {
-      const result = await getFromR2(path as string);
-      if (result.success && result.bytes) {
-        const ext = (path as string).split('.').pop()?.toLowerCase() || 'webm';
-        const mimeType = ext === 'mp3' ? 'audio/mpeg' : 'audio/webm';
-
-        const meta = segmentMetaByKey.get(segmentKey);
-        // If we cannot map this segment to a question, still include it, but mark unknown.
-        const fallbackMeta = meta ?? {
-          segmentKey,
-          partNumber: 1,
-          questionNumber: 0,
-          questionText: '',
-        };
-
-        audioContents.push({
-          segmentKey,
-          data: result.bytes,
-          mimeType,
-          partNumber: fallbackMeta.partNumber,
-          questionNumber: fallbackMeta.questionNumber,
-          questionText: fallbackMeta.questionText,
-        });
-        console.log(`[runEvaluation] Downloaded: ${segmentKey} (${result.bytes.length} bytes)`);
+      console.log(`[runEvaluation] Downloading from R2: ${r2Path}`);
+      const result = await getFromR2(r2Path as string);
+      if (!result.success || !result.bytes) {
+        throw new Error(`Failed to download: ${result.error}`);
       }
+      
+      const ext = (r2Path as string).split('.').pop()?.toLowerCase() || 'webm';
+      const mimeType = ext === 'mp3' ? 'audio/mpeg' : 'audio/webm';
+      
+      audioFiles.push({ key: audioKey, bytes: result.bytes, mimeType });
+      console.log(`[runEvaluation] Downloaded: ${r2Path} (${result.bytes.length} bytes)`);
     } catch (e) {
-      console.error(`[runEvaluation] Download error for ${segmentKey}:`, e);
+      console.error(`[runEvaluation] Download error for ${audioKey}:`, e);
     }
   }
 
-  if (audioContents.length === 0) {
-    throw new Error('No audio files could be downloaded');
+  if (audioFiles.length === 0) {
+    throw new Error('No audio files could be downloaded from R2');
   }
 
-  // Build API key queue
-  const keyQueue: { key: string; id: string | null; isUser: boolean }[] = [];
+  console.log(`[runEvaluation] Downloaded ${audioFiles.length} audio files from R2`);
 
-  // Try user's key first
+  // ============ BUILD API KEY QUEUE ============
+  interface KeyCandidate {
+    key: string;
+    keyId: string | null;
+    isUserProvided: boolean;
+  }
+
+  const keyQueue: KeyCandidate[] = [];
+
+  // 1. Try user's key first
   const { data: userSecret } = await supabaseClient
     .from('user_secrets')
     .select('encrypted_value')
@@ -370,26 +428,28 @@ async function runEvaluation(
     .eq('secret_name', 'GEMINI_API_KEY')
     .single();
 
-  if (userSecret?.encrypted_value) {
+  if (userSecret?.encrypted_value && appEncryptionKey) {
     try {
       const userKey = await decryptKey(userSecret.encrypted_value, appEncryptionKey);
-      keyQueue.push({ key: userKey, id: null, isUser: true });
+      keyQueue.push({ key: userKey, keyId: null, isUserProvided: true });
     } catch (e) {
-      console.error('[runEvaluation] User key decryption failed:', e);
+      console.warn('[runEvaluation] Failed to decrypt user API key:', e);
     }
   }
 
-  // Add admin pool keys
-  const poolKeys = await getActiveGeminiKeysForModel(supabaseService, 'flash_2_5');
-  for (const pk of poolKeys) {
-    keyQueue.push({ key: pk.key_value, id: pk.id, isUser: false });
+  // 2. Add admin keys from database pool
+  const dbApiKeys = await getActiveGeminiKeysForModel(supabaseService, 'flash_2_5');
+  for (const dbKey of dbApiKeys) {
+    keyQueue.push({ key: dbKey.key_value, keyId: dbKey.id, isUserProvided: false });
   }
 
   if (keyQueue.length === 0) {
     throw new Error('No API keys available');
   }
 
-  // Build evaluation prompt (includes segment/question mapping so output can be complete)
+  console.log(`[runEvaluation] Key queue: ${keyQueue.length} keys (${keyQueue.filter(k => k.isUserProvided).length} user, ${keyQueue.filter(k => !k.isUserProvided).length} admin)`);
+
+  // Build the evaluation prompt
   const prompt = buildPrompt(
     payload,
     topic || testRow.topic,
@@ -398,149 +458,146 @@ async function runEvaluation(
     orderedSegments,
   );
 
-  // Evaluate with key/model rotation.
-  // IMPORTANT: If a key is quota-exhausted, we do NOT retry it.
-  let result: any = null;
+  // ============ EVALUATION LOOP WITH KEY ROTATION ============
+  let evaluationResult: any = null;
   let usedModel: string | null = null;
 
-  let userKeyWasQuotaLimited = false;
+  for (const candidateKey of keyQueue) {
+    if (evaluationResult) break;
+    
+    console.log(`[runEvaluation] Trying key ${candidateKey.isUserProvided ? '(user)' : `(admin: ${candidateKey.keyId})`}`);
 
-  for (const candidate of keyQueue) {
-    if (result) break;
+    try {
+      // Initialize GenAI with this key
+      const genAI = new GoogleGenerativeAI(candidateKey.key);
 
-    // If user's key hit quota, skip it (we already marked it by flag).
-    if (candidate.isUser && userKeyWasQuotaLimited) continue;
-
-    for (const model of GEMINI_MODELS) {
-      if (result) break;
-
-      // Only retry transient 503/504. Never retry quota exhaustion.
-      for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+      // ============ UPLOAD FILES TO GOOGLE FILE API ============
+      const fileUris: Array<{ fileData: { mimeType: string; fileUri: string } }> = [];
+      
+      console.log(`[runEvaluation] Uploading ${audioFiles.length} files to Google File API...`);
+      
+      for (const audioFile of audioFiles) {
         try {
-          console.log(`[runEvaluation] Trying ${model} (attempt ${attempt + 1})`);
-
-          const inlineParts = audioContents.map((ac) => ({
-            inline_data: {
-              mime_type: ac.mimeType,
-              data: btoa(String.fromCharCode(...ac.data)),
-            },
-          }));
-
-          const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(candidate.key)}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                contents: [{ role: 'user', parts: [...inlineParts, { text: prompt }] }],
-                generationConfig: {
-                  temperature: 0.3,
-                  maxOutputTokens: 8000,
-                  responseMimeType: 'application/json',
-                },
-              }),
-            },
+          const uploadResult = await uploadToGoogleFileAPI(
+            candidateKey.key,
+            audioFile.bytes,
+            `${audioFile.key}.webm`,
+            audioFile.mimeType
           );
+          
+          fileUris.push({
+            fileData: {
+              mimeType: uploadResult.mimeType,
+              fileUri: uploadResult.uri,
+            }
+          });
+        } catch (uploadError: any) {
+          console.error(`[runEvaluation] Failed to upload ${audioFile.key}:`, uploadError?.message);
+          throw uploadError;
+        }
+      }
+      
+      console.log(`[runEvaluation] Successfully uploaded ${fileUris.length} files to Google File API`);
 
-          console.log(`[runEvaluation] ${model} response: ${response.status}`);
+      // Try each model in priority order
+      for (const modelName of GEMINI_MODELS) {
+        if (evaluationResult) break;
 
-          if (!response.ok) {
-            const errText = await response.text();
-            const kind = classifyGeminiError(response.status, errText);
-            console.error(`[runEvaluation] ${model} error (${kind}):`, errText.slice(0, 220));
+        console.log(`[runEvaluation] Attempting evaluation with model: ${modelName}`);
+        
+        const model = genAI.getGenerativeModel({ 
+          model: modelName,
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 65000,
+          },
+        });
 
-            // Model not found: try next model.
-            if (kind === 'not_found') break;
+        // Build content with file URIs (NOT base64 - avoids stack overflow)
+        const contentParts: any[] = [
+          ...fileUris, // File URIs first
+          { text: prompt } // Then the prompt
+        ];
 
-            // Quota: mark pool key exhausted (and stop using it). For user key, switch to pool.
-            if (kind === 'quota') {
-              if (candidate.isUser) {
-                userKeyWasQuotaLimited = true;
-              } else if (candidate.id) {
-                await markKeyQuotaExhausted(supabaseService, candidate.id, 'flash_2_5');
-              }
-              // Do NOT retry this key/model.
+        // Retry once on temporary rate limit
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const response = await model.generateContent({ contents: [{ role: 'user', parts: contentParts }] });
+            const text = response.response?.text?.() || '';
+
+            if (!text) {
+              console.warn(`[runEvaluation] Empty response from ${modelName}`);
               break;
             }
 
-            // Invalid key: stop using this key.
-            if (kind === 'invalid_key') {
-              if (!candidate.isUser && candidate.id) {
-                await markKeyQuotaExhausted(supabaseService, candidate.id, 'flash_2_5');
-              }
+            console.log(`[runEvaluation] Successfully received response from model: ${modelName}`);
+
+            const parsed = parseJson(text);
+            if (parsed) {
+              evaluationResult = parsed;
+              usedModel = modelName;
+              console.log(`[runEvaluation] Success with ${modelName}`);
+              break;
+            } else {
+              console.warn(`[runEvaluation] Failed to parse JSON from ${modelName}`);
               break;
             }
+          } catch (err: any) {
+            const errMsg = String(err?.message || '');
+            console.error(`[runEvaluation] Model ${modelName} failed (attempt ${attempt + 1}/2):`, errMsg.slice(0, 300));
 
-            // Retry ONLY for transient statuses.
-            const isRetryable = RETRY_CONFIG.retryableStatuses.includes(response.status);
-            if (isRetryable && attempt < RETRY_CONFIG.maxRetries) {
-              const delay = Math.min(
-                RETRY_CONFIG.initialDelayMs * Math.pow(RETRY_CONFIG.backoffMultiplier, attempt),
-                RETRY_CONFIG.maxDelayMs,
-              );
-              console.log(`[runEvaluation] Retrying in ${delay}ms...`);
-              await new Promise((r) => setTimeout(r, delay));
+            // Check for quota exhaustion
+            if (isQuotaExhaustedError(errMsg) || isPermanentQuotaExhausted(err)) {
+              // Mark pool key as exhausted
+              if (!candidateKey.isUserProvided && candidateKey.keyId) {
+                await markKeyQuotaExhausted(supabaseService, candidateKey.keyId, 'flash_2_5');
+              }
+              // Break out of retry loop and model loop - try next key
+              throw new QuotaError(errMsg, { permanent: true });
+            }
+
+            // Check for temporary rate limit
+            const retryAfter = extractRetryAfterSeconds(err);
+            if (retryAfter && attempt === 0) {
+              console.log(`[runEvaluation] Temporary rate limit, waiting ${retryAfter}s...`);
+              await sleep(Math.min(retryAfter * 1000, 60000));
               continue;
             }
 
-            // Otherwise: try next model (same key).
+            // Not retryable, try next model
             break;
           }
-
-          const data = await response.json();
-          const text = data?.candidates?.[0]?.content?.parts
-            ?.map((p: any) => p?.text)
-            .filter(Boolean)
-            .join('');
-
-          if (text) {
-            result = parseJson(text);
-            if (result) {
-              usedModel = model;
-              console.log(`[runEvaluation] Success with ${model}`);
-              break;
-            }
-          }
-
-          // Got a response but invalid JSON: try next model.
-          break;
-        } catch (err: any) {
-          console.error(`[runEvaluation] Error with ${model}:`, err?.message || String(err));
-          if (attempt < RETRY_CONFIG.maxRetries) {
-            const delay = Math.min(
-              RETRY_CONFIG.initialDelayMs * Math.pow(RETRY_CONFIG.backoffMultiplier, attempt),
-              RETRY_CONFIG.maxDelayMs,
-            );
-            await new Promise((r) => setTimeout(r, delay));
-            continue;
-          }
-          break;
         }
       }
+    } catch (keyError: any) {
+      if (keyError instanceof QuotaError) {
+        console.log(`[runEvaluation] Key quota exhausted, trying next key...`);
+        continue;
+      }
+      console.error(`[runEvaluation] Key error:`, keyError?.message);
+      // Try next key
     }
   }
 
-  if (!result) {
+  if (!evaluationResult) {
     throw new Error('Evaluation failed: all models/keys exhausted');
   }
 
   // Validate model answer lengths - Part 2 should be at least 100 words
-  const modelAnswers = result.modelAnswers || [];
+  const modelAnswers = evaluationResult.modelAnswers || [];
   for (const answer of modelAnswers) {
     if (answer.partNumber === 2 && answer.modelAnswer) {
       const wordCount = String(answer.modelAnswer).split(/\s+/).filter(Boolean).length;
       if (wordCount < 100) {
-        console.warn(`[runEvaluation] Part 2 model answer too short (${wordCount} words), but proceeding anyway`);
-        // Note: We log but don't reject - the prompt already specifies length requirements
-        // A future enhancement could retry with a different model if too short
+        console.warn(`[runEvaluation] Part 2 model answer too short (${wordCount} words)`);
       }
     }
   }
 
   // Calculate band score
-  const overallBand = result.overall_band || calculateBand(result);
+  const overallBand = evaluationResult.overall_band || calculateBand(evaluationResult);
 
-  // Build public audio URLs (client cannot access R2_PUBLIC_URL)
+  // Build public audio URLs
   const publicBase = (Deno.env.get('R2_PUBLIC_URL') || '').replace(/\/$/, '');
   const audioUrls: Record<string, string> = {};
   if (publicBase) {
@@ -550,12 +607,8 @@ async function runEvaluation(
   }
 
   // Save to ai_practice_results
-  const transcriptsByPart = (result?.transcripts_by_part && typeof result.transcripts_by_part === 'object')
-    ? result.transcripts_by_part
-    : {};
-  const transcriptsByQuestion = (result?.transcripts_by_question && typeof result.transcripts_by_question === 'object')
-    ? result.transcripts_by_question
-    : {};
+  const transcriptsByPart = evaluationResult?.transcripts_by_part || {};
+  const transcriptsByQuestion = evaluationResult?.transcripts_by_question || {};
 
   const { data: resultRow, error: saveError } = await supabaseService
     .from('ai_practice_results')
@@ -565,12 +618,11 @@ async function runEvaluation(
       module: 'speaking',
       score: Math.round(overallBand * 10),
       band_score: overallBand,
-      total_questions: audioContents.length,
+      total_questions: audioFiles.length,
       time_spent_seconds: durations
         ? Math.round(Object.values(durations as Record<string, number>).reduce((a, b) => a + b, 0))
         : 60,
-      question_results: result,
-      // IMPORTANT: store client-usable audio_urls + transcripts for results UI
+      question_results: evaluationResult,
       answers: {
         audio_urls: audioUrls,
         transcripts_by_part: transcriptsByPart,
@@ -586,7 +638,7 @@ async function runEvaluation(
     console.error('[runEvaluation] Save error:', saveError);
   }
 
-  // Mark job as completed - this triggers Realtime notification to frontend
+  // Mark job as completed - triggers Realtime notification
   await supabaseService
     .from('speaking_evaluation_jobs')
     .update({
@@ -596,7 +648,7 @@ async function runEvaluation(
     })
     .eq('id', jobId);
 
-  console.log(`[runEvaluation] Job ${jobId} completed, band: ${overallBand}`);
+  console.log(`[runEvaluation] Evaluation complete, band: ${overallBand}, result_id: ${resultRow?.id}`);
 }
 
 // Helper functions
@@ -633,77 +685,80 @@ function buildPrompt(
 
   const questionJson = JSON.stringify(questions);
   const segmentJson = JSON.stringify(orderedSegments);
+  
+  const includedParts = [...new Set(orderedSegments.map(s => s.partNumber))].sort();
+  const partsDescription = includedParts.length === 1 
+    ? `Part ${includedParts[0]} only` 
+    : `Parts ${includedParts.join(', ')}`;
 
-  return [
-    `You are a strict, professional IELTS Speaking examiner and mentor (2025 criteria).`,
-    `Your job: produce COMPLETE evaluation for EVERY recorded question, acting like a real mentor who shows the NEXT ACHIEVABLE LEVEL.`,
-    `Topic: ${topic || 'General'}. Difficulty: ${difficulty || 'Medium'}.`,
-    fluencyFlag
-      ? `Important: Part 2 speaking was under 80 seconds; reflect this in Fluency & Coherence feedback.`
-      : null,
-    ``,
-    `CRITICAL OUTPUT RULES:`,
-    `- Return STRICT JSON ONLY (no markdown, no backticks).`,
-    `- You MUST include transcripts + model answers for ALL questions listed in segment_map_json.`,
-    `- If speech is unclear, use "(inaudible)" for missing words but still return an entry.`,
-    `- Keep answers realistic and aligned to band descriptors.`,
-    ``,
-    `MODEL ANSWER STRATEGY (IMPORTANT):`,
-    `For EACH question, you will assess what band the candidate achieved for THAT SPECIFIC response.`,
-    `Then provide ONE model answer that is exactly ONE band higher - the NEXT achievable level.`,
-    `- If candidate achieved Band 4-5 on a question → provide a Band 6 model answer`,
-    `- If candidate achieved Band 5-6 on a question → provide a Band 7 model answer`,
-    `- If candidate achieved Band 6-7 on a question → provide a Band 8 model answer`,
-    `- If candidate achieved Band 8+ on a question → provide a Band 9 model answer`,
-    `This is how a real mentor helps students improve - by showing them the next step, not overwhelming them with all levels.`,
-    ``,
-    `SCORING CONSISTENCY (CRITICAL):`,
-    `- You MUST evaluate every answer; do NOT award an overall band based on the best answer only.`,
-    `- If an answer is extremely short (e.g., "test", 1–3 words) treat it as a near non-response and penalize band for that question.`,
-    `- Set modelAnswers[].estimatedBand for EVERY segment and ensure it reflects the actual response quality.`,
-    `- Compute overall_band as a weighted average of estimatedBand across all segments (Part 2 weight 2.0, Part 3 weight 1.5, Part 1 weight 1.0), then round to nearest 0.5.`,
-    `- overall_band should be consistent with criteria bands (no big mismatch).`,
-    ``,
-    `Return this exact schema and key names:`,
-    `{`,
-    `  "overall_band": 6.5,`,
-    `  "criteria": {`,
-    `    "fluency_coherence": { "band": 6.5, "feedback": "...", "strengths": ["..."], "weaknesses": ["..."], "suggestions": ["..."] },`,
-    `    "lexical_resource": { "band": 6.5, "feedback": "...", "strengths": ["..."], "weaknesses": ["..."], "suggestions": ["..."] },`,
-    `    "grammatical_range": { "band": 6.5, "feedback": "...", "strengths": ["..."], "weaknesses": ["..."], "suggestions": ["..."] },`,
-    `    "pronunciation": { "band": 6.5, "feedback": "...", "strengths": ["..."], "weaknesses": ["..."], "suggestions": ["..."] }`,
-    `  },`,
-    `  "summary": "1-3 sentences overall summary",`,
-    `  "improvements": ["Top 5 actionable improvements"],`,
-    `  "transcripts_by_part": { "1": "...", "2": "...", "3": "..." },`,
-    `  "transcripts_by_question": {`,
-    `    "1": [{"segment_key":"part1-q...","question_number":1,"question_text":"...","transcript":"..."}],`,
-    `    "2": [{"segment_key":"part2-q...","question_number":5,"question_text":"...","transcript":"..."}],`,
-    `    "3": [{"segment_key":"part3-q...","question_number":9,"question_text":"...","transcript":"..."}]`,
-    `  },`,
-    `  "modelAnswers": [{`,
-    `    "segment_key": "part1-q...",`,
-    `    "partNumber": 1,`,
-    `    "questionNumber": 1,`,
-    `    "question": "...",`,
-    `    "candidateResponse": "(copy from transcript)",`,
-    `    "estimatedBand": 6.0,`,
-    `    "targetBand": 7,`,
-    `    "modelAnswer": "A Band 7 level answer showing the next achievable level...",`,
-    `    "whyItWorks": ["Specific feature 1 that makes this a Band 7 answer", "Feature 2", "..."],`,
-    `    "keyImprovements": ["What the candidate should focus on to reach this level"]`,
-    `  }]`,
-    `}`,
-    ``,
-    `You will receive (JSON):`,
-    `- questions_json: all questions in the test`,
-    `- segment_map_json: the recorded segments you MUST cover (this is the source of truth for completeness)`,
-    ``,
-    `questions_json: ${questionJson}`,
-    `segment_map_json: ${segmentJson}`,
+  const numQ = orderedSegments.length;
+
+  return `You are a SENIOR IELTS Speaking examiner with 15+ years experience. Return ONLY valid JSON, no markdown.
+
+CONTEXT: Topic: ${topic || 'General'}, Difficulty: ${difficulty || 'Medium'}, Parts: ${partsDescription}, Questions: ${numQ}
+${fluencyFlag ? '⚠️ Part 2 under 80s - penalize Fluency & Coherence.' : ''}
+
+MANDATORY REQUIREMENTS:
+1. Listen to ALL ${numQ} audio files and transcribe EACH one fully
+2. Provide band scores (use "band" key, not "score") for ALL 4 criteria
+3. Create modelAnswers array with EXACTLY ${numQ} entries - one for each audio
+4. Include transcripts_by_question with ALL ${numQ} question transcripts
+5. All band scores must be between 1.0 and 9.0 (not zero!)
+
+EXPERT EXAMINER OBSERVATIONS (CRITICAL):
+1. **Repetition Detection**: Identify if the candidate excessively repeats the same words, phrases, or sentence structures across multiple answers.
+2. **Relevance & Topic Adherence**: Assess whether the candidate actually answers the question asked.
+3. **Response Coherence**: Evaluate if responses make logical sense.
+
+SCORING:
+- Short responses (1-10 words) = Band 4.0-4.5 max
+- Off-topic/irrelevant responses = Penalize Fluency & Coherence
+- Excessive repetition = Penalize Lexical Resource
+- Overall band = weighted average (Part2 x2.0, Part3 x1.5, Part1 x1.0)
+
+MODEL ANSWERS - WORD COUNT REQUIREMENTS (CRITICAL):
+- Part 1 answers: ~75 words each (conversational, natural response)
+- Part 2 answers: ~300 words (full long-turn response with all cue card points)
+- Part 3 answers: ~150 words each (extended discussion with reasoning)
+
+EXACT JSON SCHEMA (follow precisely):
+{
+  "overall_band": 6.0,
+  "criteria": {
+    "fluency_coherence": {"band": 6.0, "feedback": "...", "strengths": [...], "weaknesses": [...], "suggestions": [...]},
+    "lexical_resource": {"band": 6.0, "feedback": "...", "strengths": [...], "weaknesses": [...], "suggestions": [...]},
+    "grammatical_range": {"band": 5.5, "feedback": "...", "strengths": [...], "weaknesses": [...], "suggestions": [...]},
+    "pronunciation": {"band": 6.0, "feedback": "...", "strengths": [...], "weaknesses": [...], "suggestions": [...]}
+  },
+  "summary": "2-4 sentence overall performance summary",
+  "lexical_upgrades": [{"original": "good", "upgraded": "beneficial", "context": "example sentence"}],
+  "part_analysis": [{"part_number": 1, "performance_notes": "...", "key_moments": [...], "areas_for_improvement": [...]}],
+  "improvement_priorities": ["Priority 1: ...", "Priority 2: ..."],
+  "transcripts_by_part": {"1": "Full transcript for Part 1..."},
+  "transcripts_by_question": {
+    "1": [{"segment_key": "part1-q...", "question_number": 1, "question_text": "...", "transcript": "..."}]
+  },
+  "modelAnswers": [
+    {
+      "segment_key": "part1-q...",
+      "partNumber": 1,
+      "questionNumber": 1,
+      "question": "Question text",
+      "candidateResponse": "Full transcript of candidate's answer",
+      "estimatedBand": 5.5,
+      "targetBand": 6,
+      "modelAnswer": "A comprehensive model answer (~75 words for Part1, ~300 words for Part2, ~150 words for Part3)...",
+      "whyItWorks": ["Uses topic-specific vocabulary", "Clear organization"],
+      "keyImprovements": ["Add more examples", "Vary vocabulary"]
+    }
   ]
-    .filter(Boolean)
-    .join('\n');
+}
+
+INPUT DATA:
+questions_json: ${questionJson}
+segment_map_json (${numQ} segments to evaluate): ${segmentJson}
+
+CRITICAL: You MUST return exactly ${numQ} entries in modelAnswers array. Follow the word count guidelines for each part.`;
 }
 
 function parseJson(text: string): any {
@@ -728,5 +783,5 @@ function calculateBand(result: any): number {
   if (scores.length === 0) return 6.0;
   
   const avg = scores.reduce((a: number, b: number) => a + b, 0) / scores.length;
-  return Math.round(avg * 2) / 2; // Round to nearest 0.5
+  return Math.round(avg * 2) / 2;
 }
