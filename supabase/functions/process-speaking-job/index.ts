@@ -412,8 +412,9 @@ async function processJob(job: any, supabaseService: any, appEncryptionKey: stri
         });
 
         // Build content: files in order, then prompt
+        // CRITICAL: Gemini expects { fileData: { mimeType, fileUri } } NOT just the inner object
         const contentParts: any[] = [
-          ...fileUris.map(f => f.fileData),
+          ...fileUris.map(f => ({ fileData: f.fileData })),
           { text: prompt }
         ];
 
