@@ -95,6 +95,47 @@ export default function AIPracticeHistory() {
     }
   }, [user, authLoading]);
 
+  // Sort tests by most recent activity whenever tests, results, or pending evaluations change
+  useEffect(() => {
+    if (tests.length === 0) return;
+    
+    const sortedTests = [...tests].sort((a, b) => {
+      const aResult = testResults[a.id];
+      const bResult = testResults[b.id];
+      const aPending = pendingEvaluations.get(a.id);
+      const bPending = pendingEvaluations.get(b.id);
+      
+      // Get the most recent activity time for each test:
+      // 1. Pending evaluation job creation time (for retakes awaiting evaluation)
+      // 2. Result completion time (for completed tests)
+      // 3. Test generation time (for tests not yet attempted)
+      const getActivityTime = (_testId: string, result: AIPracticeResult | undefined, pending: PendingEvaluation | undefined, generatedAt: string): number => {
+        const times: number[] = [new Date(generatedAt).getTime()];
+        
+        if (result?.completed_at) {
+          times.push(new Date(result.completed_at).getTime());
+        }
+        
+        if (pending?.created_at) {
+          times.push(new Date(pending.created_at).getTime());
+        }
+        
+        return Math.max(...times);
+      };
+      
+      const aTime = getActivityTime(a.id, aResult, aPending, a.generated_at);
+      const bTime = getActivityTime(b.id, bResult, bPending, b.generated_at);
+      
+      return bTime - aTime; // Descending order (newest first)
+    });
+    
+    // Only update if order actually changed to avoid infinite loops
+    const hasChanged = sortedTests.some((t, i) => t.id !== tests[i]?.id);
+    if (hasChanged) {
+      setTests(sortedTests);
+    }
+  }, [testResults, pendingEvaluations]);
+
   // Realtime subscription for speaking evaluation jobs
   useEffect(() => {
     if (!user) return;
@@ -289,16 +330,8 @@ export default function AIPracticeHistory() {
         
         setTestResults(resultsMap);
 
-        // Sort tests by most recent activity: result completion time OR test generation time
-        const sortedTests = [...testsData].sort((a, b) => {
-          const aResult = resultsMap[a.id];
-          const bResult = resultsMap[b.id];
-          // Use result completion time if available, otherwise use test generation time
-          const aTime = aResult?.completed_at ? new Date(aResult.completed_at).getTime() : new Date(a.generated_at).getTime();
-          const bTime = bResult?.completed_at ? new Date(bResult.completed_at).getTime() : new Date(b.generated_at).getTime();
-          return bTime - aTime; // Descending order (newest first)
-        });
-        setTests(sortedTests);
+        // Sort will be applied later after pending evaluations are loaded
+        setTests(testsData);
       } else {
         setTests(testsData || []);
       }
