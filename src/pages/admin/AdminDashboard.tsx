@@ -4,6 +4,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { BookOpen, FileText, TrendingUp, Headphones, PenTool, Mic, Brain, Sparkles, Factory } from 'lucide-react';
 import ModelHealthOverviewCard from '@/components/admin/ModelHealthOverviewCard';
+import PresetCoverageGaps from '@/components/admin/PresetCoverageGaps';
 
 interface Stats {
   readingTests: number;
@@ -116,6 +117,11 @@ export default function AdminDashboard() {
 
       {/* Model Health Overview */}
       <ModelHealthOverviewCard />
+
+      {/* Preset Coverage Gaps */}
+      <div className="mb-8">
+        <PresetCoverageGaps />
+      </div>
 
       {/* Quick Actions */}
       <Card className="border-0 shadow-lg">
