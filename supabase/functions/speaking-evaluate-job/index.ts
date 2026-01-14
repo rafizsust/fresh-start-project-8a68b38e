@@ -421,11 +421,24 @@ serve(async (req) => {
                 const errMsg = String(err?.message || '');
                 console.error(`[speaking-evaluate-job] ${modelName} failed (${attempt + 1}/${MAX_RETRIES}):`, errMsg.slice(0, 200));
 
+                // Determine correct quota bucket based on model name
+                const getQuotaBucketForModel = (model: string): 'flash_2_5' | 'flash_lite' => {
+                  if (model.includes('lite')) return 'flash_lite';
+                  return 'flash_2_5';
+                };
+
                 if (isPermanentQuotaExhausted(err)) {
+                  // Mark quota exhausted for THIS specific model bucket
+                  const quotaBucket = getQuotaBucketForModel(modelName);
+                  console.log(`[speaking-evaluate-job] Permanent quota exhausted for ${modelName}, marking bucket '${quotaBucket}' exhausted`);
+                  
                   if (!candidateKey.isUserProvided && candidateKey.keyId) {
-                    await markKeyQuotaExhausted(supabaseService, candidateKey.keyId, 'flash_2_5');
+                    await markKeyQuotaExhausted(supabaseService, candidateKey.keyId, quotaBucket);
                   }
-                  throw new QuotaError(errMsg, { permanent: true });
+                  
+                  // CRITICAL: Continue to next model instead of throwing
+                  // This allows fallback to other models (e.g., flash-lite) on the SAME key
+                  break; // Break retry loop, continue to next model
                 }
 
                 if (isQuotaExhaustedError(errMsg)) {
@@ -439,7 +452,9 @@ serve(async (req) => {
                     await sleep(delay);
                     continue;
                   } else {
-                    throw new QuotaError(errMsg, { permanent: false });
+                    // Retries exhausted for rate limit - try next model instead of throwing
+                    console.log(`[speaking-evaluate-job] Rate limit retries exhausted for ${modelName}, trying next model...`);
+                    break; // Break retry loop, continue to next model
                   }
                 }
 
@@ -454,12 +469,9 @@ serve(async (req) => {
             }
           }
       } catch (keyError: any) {
-          if (keyError instanceof QuotaError) {
-            console.log(`[speaking-evaluate-job] Key quota exhausted, waiting before trying next key...`);
-            await sleep(KEY_SWITCH_DELAY_MS); // Add delay between key switches to prevent burst
-            continue;
-          }
+          // Unexpected error with this key - log and try next key
           console.error(`[speaking-evaluate-job] Key error:`, keyError?.message);
+          await sleep(KEY_SWITCH_DELAY_MS); // Add delay between key switches to prevent burst
         }
       }
 
