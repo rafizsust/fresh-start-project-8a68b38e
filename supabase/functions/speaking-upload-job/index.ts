@@ -358,10 +358,33 @@ serve(async (req) => {
 
     console.log(`[speaking-upload-job] Upload complete for ${jobId}, ${Object.keys(googleFileUris).length} files`);
 
+    // CRITICAL: Immediately trigger the evaluate job (fire-and-forget)
+    // This ensures no gap where the job sits waiting for job-runner
+    const evaluateFunctionUrl = `${supabaseUrl}/functions/v1/speaking-evaluate-job`;
+    console.log(`[speaking-upload-job] Triggering evaluate job for ${jobId}`);
+    
+    fetch(evaluateFunctionUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${supabaseServiceKey}`,
+      },
+      body: JSON.stringify({ jobId }),
+    }).then(async (res) => {
+      console.log(`[speaking-upload-job] Evaluate job trigger response: ${res.status}`);
+      if (!res.ok) {
+        const text = await res.text().catch(() => 'Unknown error');
+        console.error(`[speaking-upload-job] Evaluate job trigger failed: ${text}`);
+      }
+    }).catch((err) => {
+      console.error(`[speaking-upload-job] Failed to trigger evaluate job:`, err);
+    });
+
     return new Response(JSON.stringify({ 
       success: true, 
       status: 'pending_eval',
       filesUploaded: Object.keys(googleFileUris).length,
+      evaluateTriggered: true,
     }), {
       status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },

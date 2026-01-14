@@ -112,6 +112,7 @@ serve(async (req) => {
             .from('speaking_evaluation_jobs')
             .update({
               status: 'failed',
+              stage: 'failed',
               last_error: `Evaluation failed after ${MAX_RETRIES} attempts. Please try generating a new test or contact support.`,
               updated_at: new Date().toISOString(),
             })
@@ -120,78 +121,62 @@ serve(async (req) => {
           continue;
         }
 
-        // Mark job as "retrying" to prevent duplicate retries
+        // Determine which stage the job should retry from
+        const hasGoogleUris = job.google_file_uris && Object.keys(job.google_file_uris).length > 0;
+        const targetStage = hasGoogleUris ? 'pending_eval' : 'pending_upload';
+        const targetFunction = hasGoogleUris ? 'speaking-evaluate-job' : 'speaking-upload-job';
+
+        // Reset the job to pending state for the appropriate stage
         const { error: updateError } = await supabaseService
           .from('speaking_evaluation_jobs')
           .update({
-            status: 'retrying',
+            status: 'pending',
+            stage: targetStage,
             retry_count: currentRetryCount + 1,
-            last_error: job.status === 'processing' 
-              ? `Attempt ${currentRetryCount + 1}/${MAX_RETRIES}: Previous attempt timed out` 
-              : job.last_error,
+            lock_token: null,
+            lock_expires_at: null,
+            last_error: `Retry ${currentRetryCount + 1}/${MAX_RETRIES}: ${job.last_error || 'Unknown error'}`,
             updated_at: new Date().toISOString(),
           })
-          .eq('id', job.id)
-          .eq('status', job.status); // Optimistic lock
+          .eq('id', job.id);
 
         if (updateError) {
           console.warn(`[retry-speaking-evaluation] Failed to update job ${job.id}:`, updateError);
-          results.push({ jobId: job.id, status: 'skipped', message: 'Failed to acquire lock' });
+          results.push({ jobId: job.id, status: 'skipped', message: 'Failed to update job' });
           continue;
         }
         
-        console.log(`[retry-speaking-evaluation] Retry attempt ${currentRetryCount + 1}/${MAX_RETRIES} for job ${job.id}`);
+        console.log(`[retry-speaking-evaluation] Retry attempt ${currentRetryCount + 1}/${MAX_RETRIES} for job ${job.id}, triggering ${targetFunction}`);
 
-        // Trigger new evaluation by calling evaluate-speaking-async
-        const evalResponse = await fetch(`${supabaseUrl}/functions/v1/evaluate-speaking-async`, {
+        // Directly trigger the appropriate stage function
+        const triggerResponse = await fetch(`${supabaseUrl}/functions/v1/${targetFunction}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${supabaseAnonKey}`,
-            'x-retry-job-id': job.id, // Signal this is a retry
+            'Authorization': `Bearer ${supabaseServiceKey}`,
           },
-          body: JSON.stringify({
-            testId: job.test_id,
-            filePaths: job.file_paths,
-            durations: job.durations,
-            topic: job.topic,
-            difficulty: job.difficulty,
-            fluencyFlag: job.fluency_flag,
-            retryJobId: job.id, // Pass the existing job ID
-          }),
+          body: JSON.stringify({ jobId: job.id }),
         });
 
-        if (!evalResponse.ok) {
-          const errorText = await evalResponse.text();
-          console.error(`[retry-speaking-evaluation] Eval failed for job ${job.id}:`, errorText);
+        if (!triggerResponse.ok) {
+          const errorText = await triggerResponse.text();
+          console.error(`[retry-speaking-evaluation] ${targetFunction} failed for job ${job.id}:`, errorText);
           
-          // Mark as failed if max retries reached
-          const newRetryCount = (job.retry_count || 0) + 1;
-          if (newRetryCount >= MAX_RETRIES) {
-            await supabaseService
-              .from('speaking_evaluation_jobs')
-              .update({
-                status: 'failed',
-                last_error: `Max retries (${MAX_RETRIES}) exceeded. Last error: ${errorText.slice(0, 200)}`,
-              })
-              .eq('id', job.id);
-            results.push({ jobId: job.id, status: 'failed', message: 'Max retries exceeded' });
-          } else {
-            // Mark as stale for next retry attempt
-            await supabaseService
-              .from('speaking_evaluation_jobs')
-              .update({
-                status: 'stale',
-                last_error: errorText.slice(0, 500),
-              })
-              .eq('id', job.id);
-            results.push({ jobId: job.id, status: 'stale', message: 'Will retry later' });
-          }
+          // Mark as stale for next retry attempt
+          await supabaseService
+            .from('speaking_evaluation_jobs')
+            .update({
+              status: 'stale',
+              last_error: `Trigger failed: ${errorText.slice(0, 200)}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', job.id);
+          results.push({ jobId: job.id, status: 'stale', message: 'Will retry later' });
           continue;
         }
 
-        console.log(`[retry-speaking-evaluation] Successfully triggered retry for job ${job.id}`);
-        results.push({ jobId: job.id, status: 'retrying', message: 'Retry triggered' });
+        console.log(`[retry-speaking-evaluation] Successfully triggered ${targetFunction} for job ${job.id}`);
+        results.push({ jobId: job.id, status: 'retrying', message: `Retry triggered via ${targetFunction}` });
 
       } catch (err: any) {
         console.error(`[retry-speaking-evaluation] Error processing job ${job.id}:`, err);

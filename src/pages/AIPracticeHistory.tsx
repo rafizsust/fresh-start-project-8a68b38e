@@ -666,28 +666,32 @@ export default function AIPracticeHistory() {
                               <Eye className="w-4 h-4" />
                             </Button>
                           )}
-                          {/* Retry button for stale evaluations (not yet at max retries) */}
-                          {isPendingEval && pendingJob?.status === 'stale' && (pendingJob.retry_count || 0) < MAX_RETRIES && (
+                          {/* Retry button for stale, failed or stuck evaluations */}
+                          {isPendingEval && pendingJob && ['stale', 'failed', 'pending'].includes(pendingJob.status) && (
                             <Button
                               variant="outline"
                               size="sm"
                               onClick={() => handleRetryEvaluation(test.id)}
                               disabled={retryingJobId === pendingJob.id}
-                              className="gap-1 border-warning text-warning hover:bg-warning/10"
+                              className={cn(
+                                "gap-1",
+                                pendingJob.status === 'failed' 
+                                  ? "border-destructive text-destructive hover:bg-destructive/10"
+                                  : "border-warning text-warning hover:bg-warning/10"
+                              )}
+                              title={pendingJob.status === 'failed' 
+                                ? `Failed: ${pendingJob.last_error || 'Unknown error'}` 
+                                : 'Retry evaluation'}
                             >
                               {retryingJobId === pendingJob.id ? (
                                 <Loader2 className="w-4 h-4 animate-spin" />
                               ) : (
                                 <RefreshCw className="w-4 h-4" />
                               )}
-                              <span className="hidden sm:inline">Retry ({(pendingJob.retry_count || 0) + 1}/{MAX_RETRIES})</span>
+                              <span className="hidden sm:inline">
+                                {pendingJob.status === 'failed' ? 'Retry Failed' : `Retry`}
+                              </span>
                             </Button>
-                          )}
-                          {/* Show failed message - no retry option */}
-                          {isPendingEval && pendingJob?.status === 'failed' && (
-                            <span className="text-xs text-destructive hidden sm:inline">
-                              Max retries reached
-                            </span>
                           )}
                           <Button
                             variant="ghost"

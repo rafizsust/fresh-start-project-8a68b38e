@@ -117,6 +117,7 @@ serve(async (req) => {
     }
 
     // Step 2: Dispatch pending jobs to appropriate stage functions
+    // This is a safety net - jobs should normally be triggered directly by the previous stage
     let pendingQuery = supabaseService
       .from('speaking_evaluation_jobs')
       .select('id, stage, google_file_uris, created_at')
@@ -158,20 +159,23 @@ serve(async (req) => {
 
           console.log(`[speaking-job-runner] Dispatching job ${job.id} to ${functionName}`);
 
-          // Fire and forget - don't await the function call
+          // Fire and forget - use await to ensure we trigger it properly
           const functionUrl = `${supabaseUrl}/functions/v1/${functionName}`;
-          fetch(functionUrl, {
+          const triggerResponse = await fetch(functionUrl, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
               'Authorization': `Bearer ${supabaseServiceKey}`,
             },
             body: JSON.stringify({ jobId: job.id }),
-          }).then(res => {
-            console.log(`[speaking-job-runner] ${functionName} triggered for ${job.id}, status: ${res.status}`);
-          }).catch(err => {
-            console.error(`[speaking-job-runner] Failed to trigger ${functionName} for ${job.id}:`, err);
           });
+
+          console.log(`[speaking-job-runner] ${functionName} triggered for ${job.id}, status: ${triggerResponse.status}`);
+          
+          if (!triggerResponse.ok) {
+            const errorText = await triggerResponse.text().catch(() => 'Unknown');
+            console.error(`[speaking-job-runner] ${functionName} trigger failed for ${job.id}: ${errorText}`);
+          }
 
           results.jobsDispatched++;
         } catch (dispatchError: any) {
