@@ -15,6 +15,31 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+// Performance logging
+let serviceClientRef: any = null;
+
+async function logModelPerformance(
+  modelName: string,
+  status: 'success' | 'error' | 'quota_exceeded',
+  responseTimeMs?: number,
+  errorMessage?: string
+): Promise<void> {
+  if (!serviceClientRef) return;
+  try {
+    await serviceClientRef.rpc('log_model_performance', {
+      p_api_key_id: null,
+      p_model_name: modelName,
+      p_task_type: 'tts',
+      p_status: status,
+      p_response_time_ms: responseTimeMs || null,
+      p_error_message: errorMessage?.slice(0, 500) || null,
+    });
+    console.log(`[PerformanceLog] ${status} for ${modelName} (tts)`);
+  } catch (err) {
+    console.warn('[PerformanceLog] Failed to log:', err);
+  }
+}
+
 type TtsItem = {
   key: string;
   text: string;
@@ -88,8 +113,11 @@ async function generateTtsPcmBase64Once({
 }): Promise<{ audioBase64: string; status: number; error?: string }> {
   const prompt = `You are an IELTS Speaking examiner with a neutral British accent.\n\nRead aloud EXACTLY the following text. Do not add, remove, or paraphrase anything. Use natural pacing and clear pronunciation.\n\n"""\n${text}\n"""`;
 
+  const startTime = Date.now();
+  const modelName = 'gemini-2.5-flash-preview-tts';
+  
   const resp = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -107,16 +135,29 @@ async function generateTtsPcmBase64Once({
     }
   );
 
+  const responseTimeMs = Date.now() - startTime;
+
   if (!resp.ok) {
     const t = await resp.text();
     console.error("Gemini TTS error:", resp.status, t.slice(0, 300));
+    
+    // Log error/quota
+    const isQuota = resp.status === 429 || t.toLowerCase().includes('quota');
+    await logModelPerformance(modelName, isQuota ? 'quota_exceeded' : 'error', responseTimeMs, t.slice(0, 200));
+    
     return { audioBase64: "", status: resp.status, error: t };
   }
 
   const data = await resp.json();
   const audioData = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data as string | undefined;
-  if (!audioData) throw new Error("No audio returned from Gemini TTS");
+  if (!audioData) {
+    await logModelPerformance(modelName, 'error', responseTimeMs, 'No audio returned');
+    throw new Error("No audio returned from Gemini TTS");
+  }
 
+  // Log success
+  await logModelPerformance(modelName, 'success', responseTimeMs);
+  
   return { audioBase64: audioData, status: 200 };
 }
 
@@ -445,11 +486,14 @@ serve(async (req) => {
       });
     }
 
-    // Service client for admin API pool access
+    // Service client for admin API pool access and logging
     const serviceClient = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
+    
+    // Set service client for performance logging
+    serviceClientRef = serviceClient;
 
     let allKeys: ApiKeyWithMeta[] = [];
 

@@ -7,6 +7,29 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+// Performance logging
+async function logModelPerformance(
+  serviceClient: any,
+  modelName: string,
+  status: 'success' | 'error' | 'quota_exceeded',
+  responseTimeMs?: number,
+  errorMessage?: string
+): Promise<void> {
+  try {
+    await serviceClient.rpc('log_model_performance', {
+      p_api_key_id: null,
+      p_model_name: modelName,
+      p_task_type: 'analyze',
+      p_status: status,
+      p_response_time_ms: responseTimeMs || null,
+      p_error_message: errorMessage?.slice(0, 500) || null,
+    });
+    console.log(`[PerformanceLog] ${status} for ${modelName} (analyze)`);
+  } catch (err) {
+    console.warn('[PerformanceLog] Failed to log:', err);
+  }
+}
+
 // Decrypt user's Gemini API key
 async function decryptApiKey(encryptedValue: string, encryptionKey: string): Promise<string> {
   const encoder = new TextEncoder();
@@ -36,8 +59,9 @@ async function decryptApiKey(encryptedValue: string, encryptionKey: string): Pro
 
 const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
 
-async function callGemini(apiKey: string, systemPrompt: string, userPrompt: string): Promise<string | null> {
+async function callGemini(apiKey: string, systemPrompt: string, userPrompt: string, serviceClient?: any): Promise<string | null> {
   for (const model of GEMINI_MODELS) {
+    const startTime = Date.now();
     try {
       console.log(`Trying Gemini model: ${model}`);
       const response = await fetch(
@@ -57,16 +81,32 @@ async function callGemini(apiKey: string, systemPrompt: string, userPrompt: stri
         }
       );
 
+      const responseTimeMs = Date.now() - startTime;
+
       if (!response.ok) {
+        const errorText = await response.text();
         console.error(`Gemini ${model} failed with status ${response.status}`);
+        const isQuota = response.status === 429 || errorText.toLowerCase().includes('quota');
+        if (serviceClient) {
+          await logModelPerformance(serviceClient, model, isQuota ? 'quota_exceeded' : 'error', responseTimeMs, errorText.slice(0, 200));
+        }
         continue;
       }
 
       const data = await response.json();
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text) return text;
+      if (text) {
+        if (serviceClient) {
+          await logModelPerformance(serviceClient, model, 'success', responseTimeMs);
+        }
+        return text;
+      }
     } catch (err) {
+      const responseTimeMs = Date.now() - startTime;
       console.error(`Error with ${model}:`, err);
+      if (serviceClient) {
+        await logModelPerformance(serviceClient, model, 'error', responseTimeMs, err instanceof Error ? err.message : String(err));
+      }
       continue;
     }
   }
@@ -77,6 +117,12 @@ serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
+
+  // Service client for logging
+  const serviceClient = createClient(
+    Deno.env.get('SUPABASE_URL') ?? '',
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+  );
 
   try {
     // Create Supabase client with user auth
@@ -208,7 +254,7 @@ Provide:
 4. Recommend specific resources for improvement
 5. Be encouraging but honest about areas needing work`;
 
-    const content = await callGemini(geminiApiKey, systemPrompt, userPrompt);
+    const content = await callGemini(geminiApiKey, systemPrompt, userPrompt, serviceClient);
     
     if (!content) {
       return new Response(

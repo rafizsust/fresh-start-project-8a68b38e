@@ -7,6 +7,29 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Performance logging - logs AI calls to model_performance_logs table
+async function logModelPerformance(
+  serviceClient: any,
+  modelName: string,
+  status: 'success' | 'error' | 'quota_exceeded',
+  responseTimeMs?: number,
+  errorMessage?: string
+): Promise<void> {
+  try {
+    await serviceClient.rpc('log_model_performance', {
+      p_api_key_id: null,
+      p_model_name: modelName,
+      p_task_type: 'explain',
+      p_status: status,
+      p_response_time_ms: responseTimeMs || null,
+      p_error_message: errorMessage?.slice(0, 500) || null,
+    });
+    console.log(`[PerformanceLog] ${status} for ${modelName} (explain)`);
+  } catch (err) {
+    console.warn('[PerformanceLog] Failed to log:', err);
+  }
+}
+
 // Decrypt user's Gemini API key
 async function decryptApiKey(encryptedValue: string, encryptionKey: string): Promise<string> {
   const encoder = new TextEncoder();
@@ -37,16 +60,15 @@ async function decryptApiKey(encryptedValue: string, encryptionKey: string): Pro
 // =============================================================================
 // THE TUTOR - Follow-up Chat Models (Split-Brain Architecture)
 // =============================================================================
-// Prioritize speed and high-quota models for instant chat responses
-// These models have faster response times and higher daily quotas
 const GEMINI_MODELS = [
-  'gemini-2.0-flash-lite-preview-02-05', // 1. Primary: Instant speed, 1500 daily quota
-  'gemini-2.0-flash-lite',               // 2. Secondary: Stable Lite model
-  'gemini-2.0-flash',                    // 3. Fallback: Low latency standard
+  'gemini-2.0-flash-lite-preview-02-05',
+  'gemini-2.0-flash-lite',
+  'gemini-2.0-flash',
 ];
 
-async function callGemini(apiKey: string, prompt: string): Promise<string | null> {
+async function callGemini(apiKey: string, prompt: string, serviceClient?: any): Promise<string | null> {
   for (const model of GEMINI_MODELS) {
+    const startTime = Date.now();
     try {
       console.log(`Trying Gemini model: ${model}`);
       const response = await fetch(
@@ -64,10 +86,17 @@ async function callGemini(apiKey: string, prompt: string): Promise<string | null
         }
       );
 
+      const responseTimeMs = Date.now() - startTime;
+
       if (!response.ok) {
         const errorData = await response.json();
-        console.error(`Gemini ${model} failed:`, JSON.stringify(errorData));
-        if (response.status === 429) continue;
+        const errorText = JSON.stringify(errorData);
+        console.error(`Gemini ${model} failed:`, errorText);
+        
+        const isQuota = response.status === 429 || errorText.toLowerCase().includes('quota');
+        if (serviceClient) {
+          await logModelPerformance(serviceClient, model, isQuota ? 'quota_exceeded' : 'error', responseTimeMs, errorText.slice(0, 200));
+        }
         continue;
       }
 
@@ -75,10 +104,17 @@ async function callGemini(apiKey: string, prompt: string): Promise<string | null
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
       if (text) {
         console.log(`Success with ${model}`);
+        if (serviceClient) {
+          await logModelPerformance(serviceClient, model, 'success', responseTimeMs);
+        }
         return text;
       }
     } catch (err) {
+      const responseTimeMs = Date.now() - startTime;
       console.error(`Error with ${model}:`, err);
+      if (serviceClient) {
+        await logModelPerformance(serviceClient, model, 'error', responseTimeMs, err instanceof Error ? err.message : String(err));
+      }
       continue;
     }
   }
@@ -89,6 +125,12 @@ serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
+
+  // Service client for logging
+  const serviceClient = createClient(
+    Deno.env.get('SUPABASE_URL') ?? '',
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+  );
 
   try {
     console.log("Starting explain-answer-followup function");
@@ -195,7 +237,7 @@ First, evaluate if the student's message is meaningful and related to the questi
 
 Respond naturally as their personal tutor. Be encouraging, specific, and reference the actual ${context.module === 'listening' ? 'transcript' : 'passage'} content when helpful. Keep it conversational - 2-4 short paragraphs unless they need more detail.`;
 
-    const result = await callGemini(geminiApiKey, prompt);
+    const result = await callGemini(geminiApiKey, prompt, serviceClient);
     
     if (!result) {
       return new Response(JSON.stringify({ error: 'Failed to generate response' }), {
