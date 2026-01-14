@@ -44,6 +44,12 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function exponentialBackoffWithJitter(attempt: number, baseMs: number, maxMs: number): number {
+  const exponential = Math.min(baseMs * Math.pow(2, attempt), maxMs);
+  const jitter = Math.random() * exponential * 0.3; // 30% jitter
+  return Math.floor(exponential + jitter);
+}
+
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: number | null = null;
   const timeout = new Promise<never>((_, reject) => {
