@@ -768,7 +768,13 @@ Evaluate these responses exactly as an official IELTS examiner. Return ONLY vali
 Topic: ${topic} | Difficulty: ${difficulty} | Total Segments: ${numSegments}
 ${fluencyFlag ? '⚠️ Short Part 2 response - apply fluency penalty.' : ''}
 
-## CANDIDATE RESPONSES (from browser speech recognition)
+## IMPORTANT: TRANSCRIPT CORRECTION
+The transcripts below are from BROWSER speech recognition which is often INACCURATE.
+Use your linguistic expertise to INTELLIGENTLY CORRECT obvious transcription errors.
+Example: "10 kilo would like" should likely be "The skill I would like"
+When outputting candidateResponse and transcripts, provide your CORRECTED version, not the raw errors.
+
+## CANDIDATE RESPONSES (from browser speech recognition - may contain errors)
 ${segmentSummaries}
 
 ══════════════════════════════════════════════════════════════

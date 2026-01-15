@@ -976,8 +976,8 @@ export default function AISpeakingResults() {
                       const partMatch = key.match(/^part(\d)/);
                       const partNum = partMatch ? Number(partMatch[1]) : 1;
                       
-                      // STRICT MATCHING: Find model answer where segment_key exactly matches the audio key
-                      const matchingModel = modelAnswers.find(m => m.segment_key === key);
+                      // Case-insensitive: Find model answer where segment_key matches the audio key
+                      const matchingModel = modelAnswers.find(m => m.segment_key?.toLowerCase() === key.toLowerCase());
 
                       // Initialize with model answer data if found
                       let transcript = matchingModel?.candidateResponse || '';
@@ -985,20 +985,30 @@ export default function AISpeakingResults() {
                       let questionNumber = matchingModel?.questionNumber || 0;
                       let estimatedBand = matchingModel?.estimatedBand;
 
-                      // STRICT MATCHING: Check transcripts_by_question for exact segment_key match
+                      // STRICT MATCHING: Check transcripts_by_question for segment_key match (case-insensitive)
                       const tbq = result.candidate_transcripts.by_question;
                       if (tbq) {
                         for (const [, entries] of Object.entries(tbq)) {
                           if (Array.isArray(entries)) {
                             for (const entry of entries) {
-                              // Exact match on segment_key
-                              if (entry.segment_key === key) {
+                              // Case-insensitive match on segment_key
+                              if (entry.segment_key?.toLowerCase() === key.toLowerCase()) {
                                 transcript = transcript || entry.transcript;
                                 questionText = questionText || entry.question_text || '';
                                 questionNumber = questionNumber || entry.question_number;
                               }
                             }
                           }
+                        }
+                      }
+
+                      // Fallback to confidence_transcripts (from browser STT) if no transcript found
+                      if (!transcript && result.confidence_transcripts) {
+                        const ct = result.confidence_transcripts[key] || 
+                                   result.confidence_transcripts[key.toLowerCase()] ||
+                                   result.confidence_transcripts[key.toUpperCase()];
+                        if (ct) {
+                          transcript = ct.rawTranscript || ct.cleanedTranscript || '';
                         }
                       }
 
