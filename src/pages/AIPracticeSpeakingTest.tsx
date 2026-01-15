@@ -1209,6 +1209,20 @@ export default function AIPracticeSpeakingTest() {
       // STEP 2: Call ASYNC evaluation - returns immediately with 202
       // Include transcript data for text-based evaluation (much cheaper than audio)
       // cancelExisting: true ensures any stale jobs are cancelled before starting a new one
+      
+      // Debug: Log transcript data being sent for text-based evaluation
+      console.log('[AIPracticeSpeakingTest] Submitting transcript data:', {
+        hasTranscripts: Object.keys(transcriptData).length > 0,
+        transcriptKeys: Object.keys(transcriptData),
+        transcriptPreview: Object.fromEntries(
+          Object.entries(transcriptData).map(([k, v]) => [k, {
+            rawLength: (v as any)?.rawTranscript?.length || 0,
+            cleanedLength: (v as any)?.cleanedTranscript?.length || 0,
+            wordCount: (v as any)?.wordConfidences?.length || 0,
+          }])
+        ),
+      });
+      
       const { data, error } = await supabase.functions.invoke('evaluate-speaking-async', {
         body: {
           testId,
