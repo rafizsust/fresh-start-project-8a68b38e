@@ -122,9 +122,12 @@ serve(async (req) => {
         }
 
         // Determine which stage the job should retry from
+        const hasTranscripts = Boolean(job.partial_results?.transcripts) && Object.keys(job.partial_results.transcripts || {}).length > 0;
         const hasGoogleUris = job.google_file_uris && Object.keys(job.google_file_uris).length > 0;
-        const targetStage = hasGoogleUris ? 'pending_eval' : 'pending_upload';
-        const targetFunction = hasGoogleUris ? 'speaking-evaluate-job' : 'speaking-upload-job';
+
+        // Text-based evaluation should always retry via process-speaking-job
+        const targetStage = hasTranscripts ? 'pending_text_eval' : (hasGoogleUris ? 'pending_eval' : 'pending_upload');
+        const targetFunction = hasTranscripts ? 'process-speaking-job' : (hasGoogleUris ? 'speaking-evaluate-job' : 'speaking-upload-job');
 
         // Reset the job to pending state for the appropriate stage
         const { error: updateError } = await supabaseService

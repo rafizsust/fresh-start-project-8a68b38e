@@ -77,6 +77,9 @@ serve(async (req) => {
         if (job.stage === 'evaluating' || job.stage === 'pending_eval') {
           newStage = 'pending_eval';
         }
+        if (job.stage === 'pending_text_eval' || job.stage === 'evaluating_text') {
+          newStage = 'pending_text_eval';
+        }
 
         if (retryCount >= maxRetries && !forceRetry) {
           // Mark as failed

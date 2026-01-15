@@ -164,10 +164,21 @@ serve(async (req) => {
       });
     }
 
-    // Mark as processing
+    // Claim the job with a short lock + heartbeat so the watchdog doesn't reset it mid-run
+    const lockToken = crypto.randomUUID();
+    const lockExpiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    const hasTranscripts = Boolean(job.partial_results?.transcripts) && Object.keys(job.partial_results.transcripts || {}).length > 0;
+
     await supabaseService
       .from('speaking_evaluation_jobs')
-      .update({ status: 'processing', updated_at: new Date().toISOString() })
+      .update({
+        status: 'processing',
+        stage: hasTranscripts ? 'evaluating_text' : (job.stage || 'processing'),
+        lock_token: lockToken,
+        lock_expires_at: lockExpiresAt,
+        heartbeat_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', jobId);
 
     try {
@@ -574,12 +585,16 @@ async function processTextBasedEvaluation(job: any, supabaseService: any, appEnc
   interface KeyCandidate { key: string; keyId: string | null; isUserProvided: boolean; }
   const keyQueue: KeyCandidate[] = [];
 
-  const { data: userSecret } = await supabaseService
+  const { data: userSecret, error: userSecretError } = await supabaseService
     .from('user_secrets')
     .select('encrypted_value')
     .eq('user_id', userId)
     .eq('secret_name', 'GEMINI_API_KEY')
-    .single();
+    .maybeSingle();
+
+  if (userSecretError) {
+    console.warn('[processTextBasedEvaluation] Failed to fetch user secret:', userSecretError.message);
+  }
 
   if (userSecret?.encrypted_value && appEncryptionKey) {
     try {
@@ -590,7 +605,8 @@ async function processTextBasedEvaluation(job: any, supabaseService: any, appEnc
     }
   }
 
-  const TEXT_MODELS = ['gemini-2.5-flash']; // Removed gemini-2.0-flash due to persistent rate limiting
+  // Fallback model included to avoid "stuck" runs if 2.5-flash is temporarily unavailable
+  const TEXT_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
   const dbApiKeys = await getActiveGeminiKeysForModels(supabaseService, TEXT_MODELS);
   for (const dbKey of dbApiKeys) {
     keyQueue.push({ key: dbKey.key_value, keyId: dbKey.id, isUserProvided: false });
