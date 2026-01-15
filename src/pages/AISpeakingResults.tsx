@@ -237,6 +237,196 @@ function normalizeEvaluationReport(raw: any): EvaluationReport {
   };
 }
 
+// Instant Analysis Tab Component - displays word confidence and fluency metrics
+interface InstantTranscriptData {
+  rawTranscript?: string;
+  cleanedTranscript?: string;
+  wordConfidences?: Array<{ word: string; confidence: number; isFiller?: boolean; isRepeat?: boolean }>;
+  fluencyMetrics?: {
+    wordsPerMinute?: number;
+    pauseCount?: number;
+    fillerCount?: number;
+    fillerRatio?: number;
+    overallFluencyScore?: number;
+  };
+  prosodyMetrics?: {
+    pitchVariation?: number;
+    rhythmConsistency?: number;
+  };
+  durationMs?: number;
+  overallClarityScore?: number;
+}
+
+function InstantAnalysisTab({ transcripts }: { transcripts?: Record<string, InstantTranscriptData> }) {
+  if (!transcripts || Object.keys(transcripts).length === 0) {
+    return (
+      <Card>
+        <CardContent className="py-8 text-center">
+          <AlertCircle className="w-8 h-8 mx-auto mb-3 text-muted-foreground" />
+          <p className="text-muted-foreground">
+            Instant analysis data is not available for this test.
+          </p>
+          <p className="text-xs text-muted-foreground mt-2">
+            This feature requires browser-based speech recognition during the test.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const getConfidenceColor = (confidence: number) => {
+    if (confidence >= 90) return 'bg-success/20 text-success border-success/30';
+    if (confidence >= 75) return 'bg-warning/20 text-warning border-warning/30';
+    if (confidence >= 60) return 'bg-orange-500/20 text-orange-600 border-orange-500/30';
+    return 'bg-destructive/20 text-destructive border-destructive/30';
+  };
+
+  const sortedSegments = Object.entries(transcripts).sort(([a], [b]) => {
+    const partA = parseInt(a.match(/part(\d)/)?.[1] || '0');
+    const partB = parseInt(b.match(/part(\d)/)?.[1] || '0');
+    return partA - partB;
+  });
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-primary" />
+            Instant Speech Analysis
+          </CardTitle>
+          <CardDescription>
+            Real-time word confidence and fluency metrics captured during your test
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          {sortedSegments.map(([segmentKey, data]) => {
+            const partMatch = segmentKey.match(/part(\d)/);
+            const partNum = partMatch ? parseInt(partMatch[1]) : 0;
+            
+            return (
+              <div key={segmentKey} className="border rounded-lg p-4 space-y-4">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <Badge variant="outline">Part {partNum}</Badge>
+                  <div className="flex gap-2 flex-wrap">
+                    {data.fluencyMetrics?.wordsPerMinute && (
+                      <Badge variant="secondary" className="text-xs">
+                        {data.fluencyMetrics.wordsPerMinute} WPM
+                      </Badge>
+                    )}
+                    {data.overallClarityScore !== undefined && (
+                      <Badge variant="secondary" className="text-xs">
+                        {data.overallClarityScore}% Clarity
+                      </Badge>
+                    )}
+                    {data.fluencyMetrics?.pauseCount !== undefined && (
+                      <Badge variant="secondary" className="text-xs">
+                        {data.fluencyMetrics.pauseCount} pauses
+                      </Badge>
+                    )}
+                    {(data.fluencyMetrics?.fillerCount ?? 0) > 0 && (
+                      <Badge variant="outline" className="text-xs text-warning">
+                        {data.fluencyMetrics?.fillerCount} fillers
+                      </Badge>
+                    )}
+                  </div>
+                </div>
+
+                {/* Word Confidence Display */}
+                {data.wordConfidences && data.wordConfidences.length > 0 && (
+                  <div>
+                    <p className="text-xs text-muted-foreground mb-2">Word Confidence:</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {data.wordConfidences.map((w, idx) => (
+                        <span
+                          key={idx}
+                          className={cn(
+                            "inline-flex flex-col items-center px-1.5 py-0.5 rounded border text-xs",
+                            getConfidenceColor(w.confidence),
+                            w.isFiller && "opacity-60 italic",
+                            w.isRepeat && "line-through opacity-60"
+                          )}
+                          title={`${w.confidence}% confidence${w.isFiller ? ' (filler)' : ''}${w.isRepeat ? ' (repeat)' : ''}`}
+                        >
+                          <span className="font-medium">{w.word}</span>
+                          <span className="text-[10px] opacity-75">{w.confidence}%</span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Raw vs Cleaned Transcript */}
+                {data.rawTranscript && (
+                  <div className="space-y-2">
+                    <div>
+                      <p className="text-xs text-muted-foreground mb-1">What you said:</p>
+                      <p className="text-sm bg-muted/50 p-2 rounded">{data.rawTranscript}</p>
+                    </div>
+                    {data.cleanedTranscript && data.cleanedTranscript !== data.rawTranscript && (
+                      <div>
+                        <p className="text-xs text-muted-foreground mb-1">Cleaned (fillers removed):</p>
+                        <p className="text-sm bg-success/10 p-2 rounded border border-success/20">{data.cleanedTranscript}</p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Prosody Metrics */}
+                {data.prosodyMetrics && (
+                  <div className="flex gap-4 text-xs text-muted-foreground">
+                    {data.prosodyMetrics.pitchVariation !== undefined && (
+                      <span>Pitch Variation: {data.prosodyMetrics.pitchVariation.toFixed(0)}%</span>
+                    )}
+                    {data.prosodyMetrics.rhythmConsistency !== undefined && (
+                      <span>Rhythm: {data.prosodyMetrics.rhythmConsistency.toFixed(0)}%</span>
+                    )}
+                    {data.durationMs && (
+                      <span>Duration: {Math.round(data.durationMs / 1000)}s</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Disclaimer */}
+          <div className="flex items-start gap-2 p-3 bg-muted/50 rounded-lg text-xs text-muted-foreground">
+            <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+            <p>
+              <strong>Note:</strong> This analysis uses browser-based speech recognition and is for practice feedback only. 
+              It is NOT an official IELTS pronunciation score. Accuracy may vary based on audio quality and accent.
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Confidence Legend */}
+      <Card>
+        <CardContent className="py-3">
+          <div className="flex flex-wrap gap-3 justify-center text-xs">
+            <span className="flex items-center gap-1">
+              <span className="w-3 h-3 rounded bg-success/20 border border-success/30"></span>
+              90-100% Clear
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-3 h-3 rounded bg-warning/20 border border-warning/30"></span>
+              75-89% Good
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-3 h-3 rounded bg-orange-500/20 border border-orange-500/30"></span>
+              60-74% Okay
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-3 h-3 rounded bg-destructive/20 border border-destructive/30"></span>
+              &lt;60% Unclear
+            </span>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
 
 function normalizeSpeakingAnswers(raw: any): {
   audioUrls: Record<string, string>;
@@ -639,9 +829,10 @@ export default function AISpeakingResults() {
           </Card>
 
           <Tabs defaultValue="criteria" className="mb-6">
-            <TabsList className="w-full overflow-x-auto flex md:grid md:grid-cols-6 h-auto p-1">
+            <TabsList className="w-full overflow-x-auto flex md:grid md:grid-cols-7 h-auto p-1">
               <TabsTrigger value="criteria" className="text-xs md:text-sm px-2 md:px-3 py-1.5 whitespace-nowrap">Criteria</TabsTrigger>
               <TabsTrigger value="transcript" className="text-xs md:text-sm px-2 md:px-3 py-1.5 whitespace-nowrap">Transcript</TabsTrigger>
+              <TabsTrigger value="instant" className="text-xs md:text-sm px-2 md:px-3 py-1.5 whitespace-nowrap">Instant</TabsTrigger>
               <TabsTrigger value="model" className="text-xs md:text-sm px-2 md:px-3 py-1.5 whitespace-nowrap">Model</TabsTrigger>
               <TabsTrigger value="lexical" className="text-xs md:text-sm px-2 md:px-3 py-1.5 whitespace-nowrap">Lexical</TabsTrigger>
               <TabsTrigger value="parts" className="text-xs md:text-sm px-2 md:px-3 py-1.5 whitespace-nowrap">Parts</TabsTrigger>
@@ -719,6 +910,13 @@ export default function AISpeakingResults() {
               <ModelAnswersAccordion 
                 modelAnswers={report.modelAnswers || []} 
                 userBandScore={report.overall_band}
+              />
+            </TabsContent>
+
+            {/* Instant Analysis Tab - Word Confidence & Fluency Metrics */}
+            <TabsContent value="instant" className="mt-4 md:mt-6">
+              <InstantAnalysisTab 
+                transcripts={(result as any)?.answers?.transcripts} 
               />
             </TabsContent>
 

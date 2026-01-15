@@ -222,9 +222,16 @@ serve(async (req) => {
 });
 
 async function processJob(job: any, supabaseService: any, appEncryptionKey: string): Promise<void> {
-  const { id: jobId, user_id: userId, test_id, file_paths, durations, topic, difficulty, fluency_flag } = job;
+  const { id: jobId, user_id: userId, test_id, file_paths, durations, topic, difficulty, fluency_flag, stage, partial_results } = job;
 
-  console.log(`[processJob] Starting job ${jobId} for test ${test_id}`);
+  console.log(`[processJob] Starting job ${jobId} for test ${test_id}, stage: ${stage || 'audio'}`);
+
+  // Check if this is a text-based evaluation (transcripts available)
+  if (stage === 'pending_text_eval' && partial_results?.transcripts) {
+    console.log(`[processJob] Using text-based evaluation for job ${jobId}`);
+    await processTextBasedEvaluation(job, supabaseService, appEncryptionKey);
+    return;
+  }
 
   // Get test payload
   const { data: testRow } = await supabaseService
@@ -527,6 +534,213 @@ async function processJob(job: any, supabaseService: any, appEncryptionKey: stri
     .eq('id', jobId);
 
   console.log(`[processJob] Complete, band: ${overallBand}, result_id: ${resultRow?.id}`);
+}
+
+/**
+ * Process text-based evaluation when transcripts are available from browser speech recognition
+ */
+async function processTextBasedEvaluation(job: any, supabaseService: any, appEncryptionKey: string): Promise<void> {
+  const { id: jobId, user_id: userId, test_id, file_paths, durations, partial_results, topic, difficulty, fluency_flag } = job;
+  const transcripts = partial_results?.transcripts || {};
+
+  console.log(`[processTextBasedEvaluation] Starting for job ${jobId} with ${Object.keys(transcripts).length} segments`);
+
+  // Get test payload
+  const { data: testRow } = await supabaseService
+    .from('ai_practice_tests')
+    .select('payload, topic, difficulty, preset_id')
+    .eq('id', test_id)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (!testRow) throw new Error('Test not found');
+
+  // Build API key queue (user key first, then admin keys)
+  interface KeyCandidate { key: string; keyId: string | null; isUserProvided: boolean; }
+  const keyQueue: KeyCandidate[] = [];
+
+  const { data: userSecret } = await supabaseService
+    .from('user_secrets')
+    .select('encrypted_value')
+    .eq('user_id', userId)
+    .eq('secret_name', 'GEMINI_API_KEY')
+    .single();
+
+  if (userSecret?.encrypted_value && appEncryptionKey) {
+    try {
+      const userKey = await decryptKey(userSecret.encrypted_value, appEncryptionKey);
+      keyQueue.push({ key: userKey, keyId: null, isUserProvided: true });
+    } catch (e) {
+      console.warn('[processTextBasedEvaluation] Failed to decrypt user key:', e);
+    }
+  }
+
+  const TEXT_MODELS = ['gemini-2.0-flash', 'gemini-2.5-flash'];
+  const dbApiKeys = await getActiveGeminiKeysForModels(supabaseService, TEXT_MODELS);
+  for (const dbKey of dbApiKeys) {
+    keyQueue.push({ key: dbKey.key_value, keyId: dbKey.id, isUserProvided: false });
+  }
+
+  if (keyQueue.length === 0) throw new Error('No API keys available');
+
+  // Build the prompt
+  const prompt = buildTextPrompt(transcripts, topic || testRow.topic, difficulty || testRow.difficulty, fluency_flag, testRow.payload);
+
+  let evaluationResult: any = null;
+
+  for (const candidateKey of keyQueue) {
+    if (evaluationResult) break;
+
+    const genAI = new GoogleGenerativeAI(candidateKey.key);
+
+    for (const modelName of TEXT_MODELS) {
+      if (evaluationResult) break;
+
+      try {
+        console.log(`[processTextBasedEvaluation] Trying ${modelName}`);
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: { temperature: 0.3, maxOutputTokens: 8000 },
+        });
+
+        const response = await model.generateContent(prompt);
+        const text = response.response?.text?.() || '';
+
+        if (!text) continue;
+
+        const parsed = parseJson(text);
+        if (parsed) {
+          evaluationResult = parsed;
+          console.log(`[processTextBasedEvaluation] Success with ${modelName}`);
+          break;
+        }
+      } catch (err: any) {
+        const errMsg = String(err?.message || '');
+        console.error(`[processTextBasedEvaluation] ${modelName} error:`, errMsg.slice(0, 200));
+
+        if (isDailyQuotaExhaustedError(err)) {
+          if (!candidateKey.isUserProvided && candidateKey.keyId) {
+            await markModelQuotaExhausted(supabaseService, candidateKey.keyId, modelName);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  if (!evaluationResult) throw new Error('Text evaluation failed: all models/keys exhausted');
+
+  const overallBand = evaluationResult.overall_band || calculateBand(evaluationResult);
+
+  // Build public audio URLs if available
+  const publicBase = (Deno.env.get('R2_PUBLIC_URL') || '').replace(/\/$/, '');
+  const audioUrls: Record<string, string> = {};
+  if (publicBase && file_paths) {
+    for (const [k, r2Key] of Object.entries(file_paths as Record<string, string>)) {
+      audioUrls[k] = `${publicBase}/${String(r2Key).replace(/^\//, '')}`;
+    }
+  }
+
+  // Save result with transcripts included
+  const { data: resultRow, error: saveError } = await supabaseService
+    .from('ai_practice_results')
+    .insert({
+      test_id,
+      user_id: userId,
+      module: 'speaking',
+      score: Math.round(overallBand * 10),
+      band_score: overallBand,
+      total_questions: Object.keys(transcripts).length,
+      time_spent_seconds: durations ? Math.round(Object.values(durations as Record<string, number>).reduce((a, b) => a + b, 0)) : 60,
+      question_results: evaluationResult,
+      answers: {
+        audio_urls: audioUrls,
+        transcripts,  // Include the rich transcript data
+        transcripts_by_part: evaluationResult?.transcripts_by_part || {},
+        file_paths,
+      },
+      completed_at: new Date().toISOString(),
+    })
+    .select()
+    .single();
+
+  if (saveError) console.error('[processTextBasedEvaluation] Save error:', saveError);
+
+  // Mark job completed
+  await supabaseService
+    .from('speaking_evaluation_jobs')
+    .update({
+      status: 'completed',
+      result_id: resultRow?.id,
+      completed_at: new Date().toISOString(),
+    })
+    .eq('id', jobId);
+
+  console.log(`[processTextBasedEvaluation] Complete, band: ${overallBand}, result_id: ${resultRow?.id}`);
+}
+
+function buildTextPrompt(
+  transcripts: Record<string, any>,
+  topic: string,
+  difficulty: string,
+  fluencyFlag: boolean,
+  payload?: any
+): string {
+  const parts = Array.isArray(payload?.speakingParts) ? payload.speakingParts : [];
+  const questionById = new Map<string, { partNumber: number; questionText: string }>();
+  
+  for (const p of parts) {
+    for (const q of (p?.questions || [])) {
+      questionById.set(String(q?.id), { partNumber: Number(p?.part_number), questionText: q?.question_text || '' });
+    }
+  }
+
+  const segmentSummaries = Object.entries(transcripts).map(([key, d]: [string, any]) => {
+    const match = key.match(/^part([123])-q(.+)$/);
+    const qInfo = match ? questionById.get(match[2]) : null;
+    
+    const wpm = d?.fluencyMetrics?.wordsPerMinute || 0;
+    const fillers = d?.fluencyMetrics?.fillerCount || 0;
+    const pauses = d?.fluencyMetrics?.pauseCount || 0;
+    const clarity = d?.overallClarityScore || 0;
+    const pitch = d?.prosodyMetrics?.pitchVariation || 0;
+    const duration = d?.durationMs ? Math.round(d.durationMs / 1000) : 0;
+
+    return `
+### ${key.toUpperCase()}
+Question: ${qInfo?.questionText || 'Unknown'}
+Transcript: "${d?.rawTranscript || d?.cleanedTranscript || ''}"
+Duration: ${duration}s | WPM: ${wpm}
+Fillers: ${fillers} | Pauses: ${pauses}
+Clarity: ${clarity}% | Pitch Variation: ${pitch.toFixed(0)}%`;
+  }).join('\n');
+
+  return `You are an IELTS Speaking examiner. Evaluate these responses.
+
+## DATA
+- Transcripts from browser speech recognition
+- Fluency/prosody metrics from audio analysis
+
+Topic: ${topic} | Difficulty: ${difficulty}
+${fluencyFlag ? '⚠️ Short Part 2 response' : ''}
+
+${segmentSummaries}
+
+## OUTPUT (JSON only)
+\`\`\`json
+{
+  "overall_band": 6.5,
+  "criteria": {
+    "fluency_coherence": { "band": 6.5, "feedback": "...", "strengths": [], "weaknesses": [], "suggestions": [] },
+    "lexical_resource": { "band": 6.0, "feedback": "...", "strengths": [], "weaknesses": [], "suggestions": [] },
+    "grammatical_range": { "band": 6.5, "feedback": "...", "strengths": [], "weaknesses": [], "suggestions": [] },
+    "pronunciation": { "band": 6.0, "feedback": "...", "strengths": [], "weaknesses": [], "suggestions": [], "disclaimer": "Estimated from speech recognition patterns" }
+  },
+  "lexical_upgrades": [{"original": "...", "upgraded": "...", "context": "..."}],
+  "improvement_priorities": ["...", "..."],
+  "examiner_notes": "..."
+}
+\`\`\``;
 }
 
 async function decryptKey(encrypted: string, appKey: string): Promise<string> {
