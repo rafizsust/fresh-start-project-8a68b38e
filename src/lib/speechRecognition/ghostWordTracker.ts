@@ -3,7 +3,10 @@
  * Captures fillers that Chrome's aggressive cleanup removes
  */
 
-const FILLER_WHITELIST = new Set(["um", "uh", "erm", "ah", "er", "hmm", "hm", "mm"]);
+const FILLER_WHITELIST = new Set([
+  "um", "uh", "erm", "ah", "er", "hmm", "hm", "mm", "mmm", "mhm",
+  "umm", "ummm", "uhh", "ahh", "ehm", "uh,", "um,", "umm,", "mmm,"
+]);
 
 interface GhostWord {
   word: string;

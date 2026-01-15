@@ -89,7 +89,8 @@ declare global {
 
 // Chrome cycling interval to prevent 45-second cutoff
 const CHROME_CYCLE_INTERVAL_MS = 40000;
-const MAX_RESTART_ATTEMPTS = 5;
+// Increased restart attempts to handle longer speaking sessions (2+ minutes)
+const MAX_RESTART_ATTEMPTS = 30;
 
 export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOptions = {}) {
   const [isAnalyzing, setIsAnalyzing] = useState(false);

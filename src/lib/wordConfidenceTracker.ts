@@ -20,9 +20,10 @@ export interface WordConfidence {
 }
 
 const FILLER_WORDS = new Set([
-  'uh', 'um', 'er', 'ah', 'like', 'you know', 'i mean', 
+  'uh', 'um', 'umm', 'ummm', 'er', 'ah', 'like', 'you know', 'i mean', 
   'basically', 'actually', 'sort of', 'kind of', 'well',
-  'so', 'right', 'okay', 'yeah', 'hmm', 'ehm', 'erm',
+  'so', 'right', 'okay', 'yeah', 'hmm', 'hm', 'mm', 'mmm', 'mhm',
+  'ehm', 'erm', 'uh,', 'um,', 'umm,', 'mmm,', // with punctuation variants
   'let me see', 'let me think', 'you see', 'how do i say',
 ]);
 
@@ -114,11 +115,16 @@ export class WordConfidenceTracker {
         }
       }
 
-      // Check if filler (single word)
-      let isFiller = FILLER_WORDS.has(word);
+      // Check if filler (single word) - also check without punctuation
+      const wordClean = word.replace(/[.,!?;:]/g, '');
+      let isFiller = FILLER_WORDS.has(word) || FILLER_WORDS.has(wordClean);
       
       // Check if filler (two-word pattern)
-      if (prevWord && TWO_WORD_FILLERS.has(`${prevWord} ${word}`)) {
+      const prevWordClean = prevWord?.replace(/[.,!?;:]/g, '');
+      if (prevWord && (
+        TWO_WORD_FILLERS.has(`${prevWord} ${word}`) ||
+        TWO_WORD_FILLERS.has(`${prevWordClean} ${wordClean}`)
+      )) {
         isFiller = true;
       }
       

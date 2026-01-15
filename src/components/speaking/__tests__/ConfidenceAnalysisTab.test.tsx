@@ -22,7 +22,9 @@ interface ConfidenceTranscriptData {
   overallClarityScore?: number;
 }
 
-function getConfidenceColor(confidence: number) {
+function getConfidenceColor(confidence: number, isFiller?: boolean) {
+  // Fillers always get red/destructive color regardless of confidence
+  if (isFiller) return 'bg-destructive/20 text-destructive border-destructive/30';
   if (confidence >= 90) return 'bg-success/20 text-success border-success/30';
   if (confidence >= 75) return 'bg-warning/20 text-warning border-warning/30';
   if (confidence >= 60) return 'bg-orange-500/20 text-orange-600 border-orange-500/30';
@@ -53,6 +55,14 @@ describe('getConfidenceColor', () => {
     expect(getConfidenceColor(59)).toBe('bg-destructive/20 text-destructive border-destructive/30');
     expect(getConfidenceColor(30)).toBe('bg-destructive/20 text-destructive border-destructive/30');
     expect(getConfidenceColor(0)).toBe('bg-destructive/20 text-destructive border-destructive/30');
+  });
+
+  it('returns destructive color for fillers regardless of confidence', () => {
+    // Filler words should always be red, even with high confidence
+    expect(getConfidenceColor(100, true)).toBe('bg-destructive/20 text-destructive border-destructive/30');
+    expect(getConfidenceColor(95, true)).toBe('bg-destructive/20 text-destructive border-destructive/30');
+    expect(getConfidenceColor(80, true)).toBe('bg-destructive/20 text-destructive border-destructive/30');
+    expect(getConfidenceColor(50, true)).toBe('bg-destructive/20 text-destructive border-destructive/30');
   });
 });
 

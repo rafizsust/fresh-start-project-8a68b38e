@@ -73,7 +73,7 @@ export const DEFAULT_CONFIG: Required<SpeechRecognitionConfig> = {
   onEnd: () => {},
   onPauseDetected: () => {},
   onGhostWordRecovered: () => {},
-  maxRestartAttempts: 5,
+  maxRestartAttempts: 30, // High enough for 2+ minute recordings
   silenceTimeoutMs: 10000,
   chromeCycleIntervalMs: 40000  // 40 seconds - before Chrome's ~45s limit
 };

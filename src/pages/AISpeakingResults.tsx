@@ -293,7 +293,9 @@ function ConfidenceAnalysisTab({ transcripts }: { transcripts?: Record<string, C
     );
   }
 
-  const getConfidenceColor = (confidence: number) => {
+  const getConfidenceColor = (confidence: number, isFiller?: boolean) => {
+    // Fillers always get red/destructive color regardless of confidence
+    if (isFiller) return 'bg-destructive/20 text-destructive border-destructive/30';
     if (confidence >= 90) return 'bg-success/20 text-success border-success/30';
     if (confidence >= 75) return 'bg-warning/20 text-warning border-warning/30';
     if (confidence >= 60) return 'bg-orange-500/20 text-orange-600 border-orange-500/30';
@@ -361,8 +363,8 @@ function ConfidenceAnalysisTab({ transcripts }: { transcripts?: Record<string, C
                           key={idx}
                           className={cn(
                             "inline-flex flex-col items-center px-1.5 py-0.5 rounded border text-xs",
-                            getConfidenceColor(w.confidence),
-                            w.isFiller && "opacity-60 italic",
+                            getConfidenceColor(w.confidence, w.isFiller),
+                            w.isFiller && "italic",
                             w.isRepeat && "line-through opacity-60"
                           )}
                           title={`${w.confidence}% confidence${w.isFiller ? ' (filler)' : ''}${w.isRepeat ? ' (repeat)' : ''}`}
