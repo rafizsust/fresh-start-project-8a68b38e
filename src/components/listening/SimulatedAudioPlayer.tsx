@@ -16,6 +16,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from '@/lib/utils';
+import { detectBrowser } from '@/lib/speechRecognition/browserDetection';
+
+// Detect browser once at module level
+const browserInfo = detectBrowser();
 
 interface SimulatedAudioPlayerProps {
   text: string;
@@ -61,6 +65,9 @@ export function SimulatedAudioPlayer({
   // Session/chunk guards to prevent repeating long prompts mid-playback
   const ttsSessionRef = useRef(0);
   const chunksRef = useRef<string[]>([]);
+  
+  // Edge browser workaround: timeout ref for detecting stuck utterances
+  const edgeSafetyTimerRef = useRef<number | null>(null);
   
   // Estimate duration: ~2.5 words per second for TTS
   const wordCount = text.split(/\s+/).filter(Boolean).length;
@@ -187,23 +194,32 @@ export function SimulatedAudioPlayer({
     const speakChunk = (index: number) => {
       if (ttsSessionRef.current !== mySession) return;
 
+      // Clear any existing Edge safety timer
+      if (edgeSafetyTimerRef.current) {
+        window.clearTimeout(edgeSafetyTimerRef.current);
+        edgeSafetyTimerRef.current = null;
+      }
+
       const chunk = chunksRef.current[index];
       const utterance = new SpeechSynthesisUtterance(chunk);
       utteranceRef.current = utterance;
 
       applyVoiceSettings(utterance);
+      const rate = playbackRate * 0.9;
 
-      utterance.onstart = () => {
-        if (ttsSessionRef.current !== mySession) return;
-        if (index === 0) {
-          setIsPlaying(true);
-          setIsPaused(false);
-          startTimeRef.current = Date.now() - pausedTimeRef.current * 1000;
-          animationFrameRef.current = requestAnimationFrame(animateProgress);
+      // Track if this chunk's onend has fired
+      let chunkEndFired = false;
+
+      const handleChunkEnd = () => {
+        if (chunkEndFired) return;
+        chunkEndFired = true;
+
+        // Clear Edge safety timer
+        if (edgeSafetyTimerRef.current) {
+          window.clearTimeout(edgeSafetyTimerRef.current);
+          edgeSafetyTimerRef.current = null;
         }
-      };
 
-      utterance.onend = () => {
         if (ttsSessionRef.current !== mySession) return;
 
         const nextIndex = index + 1;
@@ -222,10 +238,51 @@ export function SimulatedAudioPlayer({
         onComplete?.();
       };
 
+      utterance.onstart = () => {
+        if (ttsSessionRef.current !== mySession) return;
+        if (index === 0) {
+          setIsPlaying(true);
+          setIsPaused(false);
+          startTimeRef.current = Date.now() - pausedTimeRef.current * 1000;
+          animationFrameRef.current = requestAnimationFrame(animateProgress);
+        }
+
+        // Edge workaround: Set a safety timeout based on estimated speech duration
+        if (browserInfo.isEdge) {
+          const estimatedChunkDuration = Math.max(3000, (chunk.length * 80 / rate) + 2000);
+          console.log(`[SimulatedAudio Edge] Safety timer set for ${estimatedChunkDuration}ms for chunk ${index + 1}/${chunksRef.current.length}`);
+          
+          edgeSafetyTimerRef.current = window.setTimeout(() => {
+            if (ttsSessionRef.current === mySession && !chunkEndFired) {
+              console.warn('[SimulatedAudio Edge] Safety timeout triggered - forcing progression');
+              window.speechSynthesis.cancel();
+              handleChunkEnd();
+            }
+          }, estimatedChunkDuration);
+        }
+      };
+
+      utterance.onend = () => {
+        handleChunkEnd();
+      };
+
       utterance.onerror = (e) => {
+        // Clear Edge safety timer on error
+        if (edgeSafetyTimerRef.current) {
+          window.clearTimeout(edgeSafetyTimerRef.current);
+          edgeSafetyTimerRef.current = null;
+        }
+
         // Ignore barge-in cancels
         const err = (e as any)?.error;
         if (err === 'canceled') return;
+
+        // Edge sometimes fires 'interrupted' error when we force progression
+        if (browserInfo.isEdge && err === 'interrupted') {
+          console.log('[SimulatedAudio Edge] Interrupted error treated as success');
+          handleChunkEnd();
+          return;
+        }
 
         console.error('TTS error:', e);
         setIsPlaying(false);
