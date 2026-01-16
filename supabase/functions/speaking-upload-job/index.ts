@@ -215,40 +215,28 @@ serve(async (req) => {
       }
     }
 
-    // Build segment ordering
-    const parts = Array.isArray(payload?.speakingParts) ? payload.speakingParts : [];
-    const questionById = new Map<string, { partNumber: 1 | 2 | 3; questionNumber: number; questionText: string }>();
+    // Build segment ordering - extract part number directly from segment key
+    // Segment keys are formatted as: part{1|2|3}-q{questionId}
+    // We just need to extract the part number, the questionId can contain hyphens
+    const orderedSegments: Array<{ segmentKey: string; partNumber: 1 | 2 | 3; index: number }> = [];
     
-    for (const p of parts) {
-      const partNumber = Number(p?.part_number) as 1 | 2 | 3;
-      if (partNumber !== 1 && partNumber !== 2 && partNumber !== 3) continue;
-      const qs = Array.isArray(p?.questions) ? p.questions : [];
-      for (const q of qs) {
-        const id = String(q?.id || '');
-        if (!id) continue;
-        questionById.set(id, {
-          partNumber,
-          questionNumber: Number(q?.question_number),
-          questionText: String(q?.question_text || ''),
-        });
+    for (const segmentKey of Object.keys(filePathsMap)) {
+      // Match part number from the beginning of the key: part1-, part2-, or part3-
+      const partMatch = String(segmentKey).match(/^part([123])-/);
+      if (partMatch) {
+        const partNumber = Number(partMatch[1]) as 1 | 2 | 3;
+        orderedSegments.push({ segmentKey, partNumber, index: orderedSegments.length });
+      } else {
+        // If no part pattern found, still include it with a default ordering
+        console.warn(`[speaking-upload-job] Segment key ${segmentKey} doesn't match part pattern, including anyway`);
+        orderedSegments.push({ segmentKey, partNumber: 1, index: orderedSegments.length });
       }
     }
 
-    const orderedSegments: Array<{ segmentKey: string; partNumber: 1 | 2 | 3; questionNumber: number }> = [];
-    
-    for (const segmentKey of Object.keys(filePathsMap)) {
-      const m = String(segmentKey).match(/^part([123])\-q(.+)$/);
-      if (!m) continue;
-      const partNumber = Number(m[1]) as 1 | 2 | 3;
-      const questionId = m[2];
-      const q = questionById.get(questionId);
-      if (!q) continue;
-      orderedSegments.push({ segmentKey, partNumber, questionNumber: q.questionNumber });
-    }
-
+    // Sort by part number, then by original order
     orderedSegments.sort((a, b) => {
       if (a.partNumber !== b.partNumber) return a.partNumber - b.partNumber;
-      return a.questionNumber - b.questionNumber;
+      return a.index - b.index;
     });
 
     console.log(`[speaking-upload-job] Processing ${orderedSegments.length} segments`);

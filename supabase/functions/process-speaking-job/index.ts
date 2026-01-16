@@ -285,8 +285,11 @@ async function processJob(job: any, supabaseService: any, appEncryptionKey: stri
     }
   }
 
-  // Build segment metadata
+  // Build segment ordering from file_paths - extract part number directly from key
+  // Segment keys are formatted as: part{1|2|3}-q{questionId} where questionId may contain hyphens
   const parts = Array.isArray(payload?.speakingParts) ? payload.speakingParts : [];
+  
+  // Build question lookup for context (used for prompts, not for filtering)
   const questionById = new Map<string, { partNumber: 1 | 2 | 3; questionNumber: number; questionText: string }>();
   for (const p of parts) {
     const partNumber = Number(p?.part_number) as 1 | 2 | 3;
@@ -303,35 +306,53 @@ async function processJob(job: any, supabaseService: any, appEncryptionKey: stri
     }
   }
 
-  const segmentMetaByKey = new Map<
-    string,
-    { segmentKey: string; partNumber: 1 | 2 | 3; questionNumber: number; questionText: string }
-  >();
-
-  for (const segmentKey of Object.keys(file_paths as Record<string, string>)) {
-    const m = String(segmentKey).match(/^part([123])\-q(.+)$/);
-    if (!m) continue;
-    const partNumber = Number(m[1]) as 1 | 2 | 3;
-    const questionId = m[2];
+  // Build segment list - process ALL file paths, extract part number from key prefix
+  const segmentList: Array<{ segmentKey: string; partNumber: 1 | 2 | 3; questionNumber: number; questionText: string; originalIndex: number }> = [];
+  const filePathsMap = file_paths as Record<string, string>;
+  
+  let idx = 0;
+  for (const segmentKey of Object.keys(filePathsMap)) {
+    // Extract part number from key prefix: part1-, part2-, part3-
+    const partMatch = String(segmentKey).match(/^part([123])-q(.+)$/);
+    let partNumber: 1 | 2 | 3 = 1;
+    let questionId = '';
+    
+    if (partMatch) {
+      partNumber = Number(partMatch[1]) as 1 | 2 | 3;
+      questionId = partMatch[2]; // This may contain additional hyphens
+    } else {
+      // Fallback - try simpler pattern
+      const simpleMatch = String(segmentKey).match(/^part([123])-/);
+      if (simpleMatch) {
+        partNumber = Number(simpleMatch[1]) as 1 | 2 | 3;
+      }
+      console.warn(`[processJob] Segment key ${segmentKey} has unusual format, defaulting to part ${partNumber}`);
+    }
+    
+    // Try to find question context, but don't skip if not found
     const q = questionById.get(questionId);
-    if (!q) continue;
-    segmentMetaByKey.set(segmentKey, {
+    segmentList.push({
       segmentKey,
       partNumber,
-      questionNumber: q.questionNumber,
-      questionText: q.questionText,
+      questionNumber: q?.questionNumber ?? (idx + 1),
+      questionText: q?.questionText ?? `Question for ${segmentKey}`,
+      originalIndex: idx,
     });
+    idx++;
   }
 
-  const orderedSegments = Array.from(segmentMetaByKey.values()).sort((a, b) => {
+  // Sort by part number, then by question number, then by original order
+  const orderedSegments = segmentList.sort((a, b) => {
     if (a.partNumber !== b.partNumber) return a.partNumber - b.partNumber;
-    return a.questionNumber - b.questionNumber;
+    if (a.questionNumber !== b.questionNumber) return a.questionNumber - b.questionNumber;
+    return a.originalIndex - b.originalIndex;
   });
+
+  console.log(`[processJob] Processing ${orderedSegments.length} segments from file_paths`);
 
   // Download audio files in exact order
   console.log('[processJob] Downloading audio files from R2...');
   const audioFiles: { index: number; key: string; bytes: Uint8Array; mimeType: string }[] = [];
-  const filePathsMap = file_paths as Record<string, string>;
 
   for (let i = 0; i < orderedSegments.length; i++) {
     const segment = orderedSegments[i];
