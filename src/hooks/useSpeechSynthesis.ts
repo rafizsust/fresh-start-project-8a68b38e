@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import { detectBrowser } from '@/lib/speechRecognition/browserDetection';
 
 interface SpeechSynthesisConfig {
   voiceName?: string;
@@ -16,6 +17,9 @@ interface SpeechSynthesisConfig {
 let currentTTSVolume = 1;
 let currentTTSMuted = false;
 
+// Detect browser once at module level
+const browserInfo = detectBrowser();
+
 export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -31,6 +35,10 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
   const activeChunksRef = useRef<string[]>([]);
   const activeChunkIndexRef = useRef(0);
   const isCancellingRef = useRef(false);
+  
+  // Edge browser workaround: timeout refs for detecting stuck utterances
+  const edgeSafetyTimerRef = useRef<number | null>(null);
+  const utteranceStartTimeRef = useRef<number>(0);
 
   const sanitizeText = (t: string) =>
     t
@@ -171,26 +179,38 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
           if (!window.speechSynthesis) return;
           if (activeSessionRef.current !== sessionId) return;
 
+          // Clear any existing Edge safety timer
+          if (edgeSafetyTimerRef.current) {
+            window.clearTimeout(edgeSafetyTimerRef.current);
+            edgeSafetyTimerRef.current = null;
+          }
+
           const chunk = activeChunksRef.current[index];
           const utterance = new SpeechSynthesisUtterance(chunk);
           utteranceRef.current = utterance;
 
           if (selectedVoice) utterance.voice = selectedVoice;
 
+          const rate = options?.rate ?? config.rate ?? 0.95;
           utterance.lang = options?.lang ?? config.lang ?? 'en-GB';
-          utterance.rate = options?.rate ?? config.rate ?? 0.95;
+          utterance.rate = rate;
           utterance.pitch = options?.pitch ?? config.pitch ?? 1;
           // Use current muted state and volume
           utterance.volume = currentTTSMuted ? 0 : (options?.volume ?? currentTTSVolume ?? config.volume ?? 1);
 
-          utterance.onstart = () => {
-            if (activeSessionRef.current !== sessionId) return;
-            setIsSpeaking(true);
-            setIsPaused(false);
-            if (index === 0) config.onStart?.();
-          };
+          // Track if this chunk's onend has fired
+          let chunkEndFired = false;
 
-          utterance.onend = () => {
+          const handleChunkEnd = () => {
+            if (chunkEndFired) return;
+            chunkEndFired = true;
+
+            // Clear Edge safety timer
+            if (edgeSafetyTimerRef.current) {
+              window.clearTimeout(edgeSafetyTimerRef.current);
+              edgeSafetyTimerRef.current = null;
+            }
+
             if (activeSessionRef.current !== sessionId) return;
 
             const nextIndex = index + 1;
@@ -212,10 +232,53 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
             }
           };
 
+          utterance.onstart = () => {
+            if (activeSessionRef.current !== sessionId) return;
+            setIsSpeaking(true);
+            setIsPaused(false);
+            utteranceStartTimeRef.current = Date.now();
+            if (index === 0) config.onStart?.();
+
+            // Edge workaround: Set a safety timeout based on estimated speech duration
+            // Edge sometimes doesn't fire onend, causing speech to appear stuck
+            if (browserInfo.isEdge) {
+              // Estimate: ~80ms per character at rate 0.95, plus 2s buffer
+              const estimatedDuration = Math.max(3000, (chunk.length * 80 / rate) + 2000);
+              console.log(`[TTS Edge] Safety timer set for ${estimatedDuration}ms for chunk ${index + 1}/${activeChunksRef.current.length}`);
+              
+              edgeSafetyTimerRef.current = window.setTimeout(() => {
+                // Check if speech is actually still pending/speaking
+                if (activeSessionRef.current === sessionId && !chunkEndFired) {
+                  console.warn('[TTS Edge] Safety timeout triggered - forcing progression');
+                  // Force cancel and move on
+                  window.speechSynthesis.cancel();
+                  handleChunkEnd();
+                }
+              }, estimatedDuration);
+            }
+          };
+
+          utterance.onend = () => {
+            handleChunkEnd();
+          };
+
           utterance.onerror = (event) => {
+            // Clear Edge safety timer on error too
+            if (edgeSafetyTimerRef.current) {
+              window.clearTimeout(edgeSafetyTimerRef.current);
+              edgeSafetyTimerRef.current = null;
+            }
+
             // Ignore 'canceled' errors as they're intentional (barge-in)
             if (event.error === 'canceled' || isCancellingRef.current) {
               setIsSpeaking(false);
+              return;
+            }
+
+            // Edge sometimes fires 'interrupted' error when we force progression - treat as success
+            if (browserInfo.isEdge && event.error === 'interrupted') {
+              console.log('[TTS Edge] Interrupted error treated as success');
+              handleChunkEnd();
               return;
             }
 
@@ -226,6 +289,10 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
           };
 
           utterance.onboundary = (event) => {
+            // Reset safety timer on boundary events (proves speech is progressing)
+            if (browserInfo.isEdge && edgeSafetyTimerRef.current) {
+              utteranceStartTimeRef.current = Date.now();
+            }
             config.onBoundary?.(event.charIndex);
           };
 
@@ -256,6 +323,12 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
     activeChunksRef.current = [];
     activeChunkIndexRef.current = 0;
     speechQueueRef.current = [];
+
+    // Clear Edge safety timer
+    if (edgeSafetyTimerRef.current) {
+      window.clearTimeout(edgeSafetyTimerRef.current);
+      edgeSafetyTimerRef.current = null;
+    }
 
     isCancellingRef.current = true;
     window.speechSynthesis?.cancel();
