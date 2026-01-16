@@ -38,6 +38,7 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
   
   // Edge browser workaround: timeout refs for detecting stuck utterances
   const edgeSafetyTimerRef = useRef<number | null>(null);
+  const edgeStartupTimerRef = useRef<number | null>(null);
   const utteranceStartTimeRef = useRef<number>(0);
 
   const sanitizeText = (t: string) =>
@@ -179,10 +180,14 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
           if (!window.speechSynthesis) return;
           if (activeSessionRef.current !== sessionId) return;
 
-          // Clear any existing Edge safety timer
+          // Clear any existing Edge safety timers
           if (edgeSafetyTimerRef.current) {
             window.clearTimeout(edgeSafetyTimerRef.current);
             edgeSafetyTimerRef.current = null;
+          }
+          if (edgeStartupTimerRef.current) {
+            window.clearTimeout(edgeStartupTimerRef.current);
+            edgeStartupTimerRef.current = null;
           }
 
           const chunk = activeChunksRef.current[index];
@@ -200,15 +205,20 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
 
           // Track if this chunk's onend has fired
           let chunkEndFired = false;
+          let onstartFired = false;
 
           const handleChunkEnd = () => {
             if (chunkEndFired) return;
             chunkEndFired = true;
 
-            // Clear Edge safety timer
+            // Clear Edge safety timers
             if (edgeSafetyTimerRef.current) {
               window.clearTimeout(edgeSafetyTimerRef.current);
               edgeSafetyTimerRef.current = null;
+            }
+            if (edgeStartupTimerRef.current) {
+              window.clearTimeout(edgeStartupTimerRef.current);
+              edgeStartupTimerRef.current = null;
             }
 
             if (activeSessionRef.current !== sessionId) return;
@@ -233,6 +243,14 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
           };
 
           utterance.onstart = () => {
+            onstartFired = true;
+            
+            // Clear startup timer since onstart fired successfully
+            if (edgeStartupTimerRef.current) {
+              window.clearTimeout(edgeStartupTimerRef.current);
+              edgeStartupTimerRef.current = null;
+            }
+            
             if (activeSessionRef.current !== sessionId) return;
             setIsSpeaking(true);
             setIsPaused(false);
@@ -263,10 +281,14 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
           };
 
           utterance.onerror = (event) => {
-            // Clear Edge safety timer on error too
+            // Clear Edge safety timers on error too
             if (edgeSafetyTimerRef.current) {
               window.clearTimeout(edgeSafetyTimerRef.current);
               edgeSafetyTimerRef.current = null;
+            }
+            if (edgeStartupTimerRef.current) {
+              window.clearTimeout(edgeStartupTimerRef.current);
+              edgeStartupTimerRef.current = null;
             }
 
             // Ignore 'canceled' errors as they're intentional (barge-in)
@@ -297,6 +319,19 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
           };
 
           window.speechSynthesis.speak(utterance);
+          
+          // Edge workaround: Set a STARTUP timeout - if onstart doesn't fire within 3 seconds,
+          // the TTS is stuck and we need to force progression
+          if (browserInfo.isEdge) {
+            console.log(`[TTS Edge] Startup timer set for 3000ms - chunk ${index + 1}`);
+            edgeStartupTimerRef.current = window.setTimeout(() => {
+              if (activeSessionRef.current === sessionId && !onstartFired && !chunkEndFired) {
+                console.warn('[TTS Edge] Startup timeout - onstart never fired, forcing progression');
+                window.speechSynthesis.cancel();
+                handleChunkEnd();
+              }
+            }, 3000);
+          }
         };
 
         speakChunk(0);
@@ -324,10 +359,14 @@ export function useSpeechSynthesis(config: SpeechSynthesisConfig = {}) {
     activeChunkIndexRef.current = 0;
     speechQueueRef.current = [];
 
-    // Clear Edge safety timer
+    // Clear Edge safety timers
     if (edgeSafetyTimerRef.current) {
       window.clearTimeout(edgeSafetyTimerRef.current);
       edgeSafetyTimerRef.current = null;
+    }
+    if (edgeStartupTimerRef.current) {
+      window.clearTimeout(edgeStartupTimerRef.current);
+      edgeStartupTimerRef.current = null;
     }
 
     isCancellingRef.current = true;

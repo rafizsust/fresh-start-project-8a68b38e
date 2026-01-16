@@ -66,8 +66,9 @@ export function SimulatedAudioPlayer({
   const ttsSessionRef = useRef(0);
   const chunksRef = useRef<string[]>([]);
   
-  // Edge browser workaround: timeout ref for detecting stuck utterances
+  // Edge browser workaround: timeout refs for detecting stuck utterances
   const edgeSafetyTimerRef = useRef<number | null>(null);
+  const edgeStartupTimerRef = useRef<number | null>(null);
   
   // Estimate duration: ~2.5 words per second for TTS
   const wordCount = text.split(/\s+/).filter(Boolean).length;
@@ -194,10 +195,14 @@ export function SimulatedAudioPlayer({
     const speakChunk = (index: number) => {
       if (ttsSessionRef.current !== mySession) return;
 
-      // Clear any existing Edge safety timer
+      // Clear any existing Edge safety timers
       if (edgeSafetyTimerRef.current) {
         window.clearTimeout(edgeSafetyTimerRef.current);
         edgeSafetyTimerRef.current = null;
+      }
+      if (edgeStartupTimerRef.current) {
+        window.clearTimeout(edgeStartupTimerRef.current);
+        edgeStartupTimerRef.current = null;
       }
 
       const chunk = chunksRef.current[index];
@@ -209,15 +214,20 @@ export function SimulatedAudioPlayer({
 
       // Track if this chunk's onend has fired
       let chunkEndFired = false;
+      let onstartFired = false;
 
       const handleChunkEnd = () => {
         if (chunkEndFired) return;
         chunkEndFired = true;
 
-        // Clear Edge safety timer
+        // Clear Edge safety timers
         if (edgeSafetyTimerRef.current) {
           window.clearTimeout(edgeSafetyTimerRef.current);
           edgeSafetyTimerRef.current = null;
+        }
+        if (edgeStartupTimerRef.current) {
+          window.clearTimeout(edgeStartupTimerRef.current);
+          edgeStartupTimerRef.current = null;
         }
 
         if (ttsSessionRef.current !== mySession) return;
@@ -239,6 +249,14 @@ export function SimulatedAudioPlayer({
       };
 
       utterance.onstart = () => {
+        onstartFired = true;
+        
+        // Clear startup timer since onstart fired successfully
+        if (edgeStartupTimerRef.current) {
+          window.clearTimeout(edgeStartupTimerRef.current);
+          edgeStartupTimerRef.current = null;
+        }
+        
         if (ttsSessionRef.current !== mySession) return;
         if (index === 0) {
           setIsPlaying(true);
@@ -267,10 +285,14 @@ export function SimulatedAudioPlayer({
       };
 
       utterance.onerror = (e) => {
-        // Clear Edge safety timer on error
+        // Clear Edge safety timers on error
         if (edgeSafetyTimerRef.current) {
           window.clearTimeout(edgeSafetyTimerRef.current);
           edgeSafetyTimerRef.current = null;
+        }
+        if (edgeStartupTimerRef.current) {
+          window.clearTimeout(edgeStartupTimerRef.current);
+          edgeStartupTimerRef.current = null;
         }
 
         // Ignore barge-in cancels
@@ -293,6 +315,19 @@ export function SimulatedAudioPlayer({
       };
 
       window.speechSynthesis.speak(utterance);
+      
+      // Edge workaround: Set a STARTUP timeout - if onstart doesn't fire within 3 seconds,
+      // the TTS is stuck and we need to force progression
+      if (browserInfo.isEdge) {
+        console.log(`[SimulatedAudio Edge] Startup timer set for 3000ms - chunk ${index + 1}`);
+        edgeStartupTimerRef.current = window.setTimeout(() => {
+          if (ttsSessionRef.current === mySession && !onstartFired && !chunkEndFired) {
+            console.warn('[SimulatedAudio Edge] Startup timeout - onstart never fired, forcing progression');
+            window.speechSynthesis.cancel();
+            handleChunkEnd();
+          }
+        }, 3000);
+      }
     };
 
     // Reset progress for a fresh play
@@ -372,6 +407,13 @@ export function SimulatedAudioPlayer({
     return () => {
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
+      }
+      // Clear Edge safety timers
+      if (edgeSafetyTimerRef.current) {
+        window.clearTimeout(edgeSafetyTimerRef.current);
+      }
+      if (edgeStartupTimerRef.current) {
+        window.clearTimeout(edgeStartupTimerRef.current);
       }
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
