@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useToast } from '@/hooks/use-toast';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { 
   Database, 
   Trash2,
@@ -17,7 +18,8 @@ import {
   Mic,
   Search,
   Calendar,
-  Filter
+  Filter,
+  Sparkles,
 } from 'lucide-react';
 import {
   Table,
@@ -53,6 +55,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import TestBankRecommendations from '@/components/admin/TestBankRecommendations';
 
 interface GeneratedTest {
   id: string;
@@ -261,6 +264,25 @@ export default function TestBankAdmin() {
           </div>
         </div>
       </div>
+
+      {/* Main Tabs */}
+      <Tabs defaultValue="bank" className="space-y-6">
+        <TabsList className="grid w-full max-w-md grid-cols-2">
+          <TabsTrigger value="bank" className="flex items-center gap-2">
+            <Database className="w-4 h-4" />
+            Test Bank
+          </TabsTrigger>
+          <TabsTrigger value="recommendations" className="flex items-center gap-2">
+            <Sparkles className="w-4 h-4" />
+            Recommendations
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="recommendations">
+          <TestBankRecommendations />
+        </TabsContent>
+
+        <TabsContent value="bank">
 
       {/* Filters */}
       <Card className="border-0 shadow-lg mb-6">
@@ -494,6 +516,8 @@ export default function TestBankAdmin() {
           )}
         </CardContent>
       </Card>
+        </TabsContent>
+      </Tabs>
 
       {/* Preview Dialog */}
       <Dialog open={!!previewTest} onOpenChange={() => setPreviewTest(null)}>
