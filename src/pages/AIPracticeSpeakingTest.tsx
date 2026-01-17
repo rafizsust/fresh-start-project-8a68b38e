@@ -40,7 +40,7 @@ import { AudioLevelIndicator, AudioVolumeControl, AudioWaveformIndicator } from 
 import { useFullscreenTest } from '@/hooks/useFullscreenTest';
 import { compressAudio } from '@/utils/audioCompressor';
 import { useAdvancedSpeechAnalysis, SpeechAnalysisResult } from '@/hooks/useAdvancedSpeechAnalysis';
-import { BrowserCompatibilityCheck } from '@/components/speaking/BrowserCompatibilityCheck';
+
 
 // IELTS Official Timings
 const TIMING = {
@@ -1816,10 +1816,6 @@ export default function AIPracticeSpeakingTest() {
           initialAccent={selectedAccent}
           initialEvaluationMode={evaluationMode}
         />
-        {/* Browser compatibility check for speech analysis */}
-        <div className="max-w-md w-full px-4">
-          <BrowserCompatibilityCheck />
-        </div>
       </div>
     );
   }

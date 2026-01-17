@@ -831,15 +831,16 @@ IMPORTANT OUTPUT LIMITS:
 TARGET BAND CALCULATION RULES
 ══════════════════════════════════════════════════════════════
 
-For each question's modelAnswer, set targetBand as follows:
-- estimatedBand 1-4.5 → targetBand = 5
-- estimatedBand 5-5.5 → targetBand = 6
-- estimatedBand 6-6.5 → targetBand = 7
-- estimatedBand 7-7.5 → targetBand = 8
-- estimatedBand 8+ → targetBand = 9
+CRITICAL: For ALL modelAnswers, use a UNIFIED targetBand:
+1. Calculate the highest band score among all 4 criteria (FC, LR, GRA, P)
+2. Set targetBand = highest_criteria_score + 1 (max 9)
+3. ALL model answers should be written at this SAME targetBand level
 
-CRITICAL: Write the modelAnswer at EXACTLY the targetBand level, NOT higher!
-If targetBand is 6, write a Band 6 answer (not Band 7 or 8).
+Example: If criteria scores are FC=6, LR=6, GRA=5.5, P=6
+- Highest = 6
+- targetBand = 7 for ALL answers
+
+Write ALL modelAnswers at the targetBand level to show the next achievable level.
 
 Return EXACTLY ${numQ} transcripts and ${numQ} modelAnswers.`;
 }

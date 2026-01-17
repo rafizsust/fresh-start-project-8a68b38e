@@ -72,12 +72,6 @@ const GEMINI_MODELS: ModelConfig[] = [
     description: 'Writing evaluation primary',
     apiName: 'gemini-3-pro-preview',
   },
-  {
-    id: 'gemini_exp_1206',
-    displayName: 'Exp 1206',
-    description: 'Test generation, complex tasks',
-    apiName: 'gemini-exp-1206',
-  },
 ];
 
 interface ApiKeyWithQuotas {
