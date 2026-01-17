@@ -477,7 +477,7 @@ export function MicrophoneTest({ onTestComplete, onBack, initialAccent, initialE
                 <span className="text-xs px-1.5 py-0.5 rounded bg-primary/10 text-primary">Recommended</span>
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Audio sent directly to AI for precise evaluation
+                Audio sent directly to AI for precise evaluation (uses more AI tokens)
               </p>
             </div>
           </label>

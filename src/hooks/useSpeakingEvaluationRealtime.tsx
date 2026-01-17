@@ -3,6 +3,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
 import { useNavigate } from 'react-router-dom';
 import { playCompletionSound } from '@/lib/sounds';
+import { useBrowserNotifications } from '@/hooks/useBrowserNotifications';
 
 interface EvaluationJob {
   id: string;
@@ -40,6 +41,7 @@ export function useSpeakingEvaluationRealtime({
 }: UseSpeakingEvaluationRealtimeOptions) {
   const { toast } = useToast();
   const navigate = useNavigate();
+  const { notifyEvaluationComplete, notifyEvaluationFailed } = useBrowserNotifications();
 
   const [jobStatus, setJobStatus] = useState<EvaluationJob['status'] | null>(null);
   const [jobStage, setJobStage] = useState<string | null>(null);
@@ -133,6 +135,11 @@ export function useSpeakingEvaluationRealtime({
           // Play notification sound to alert user
           playCompletionSound();
           
+          // Show browser notification
+          notifyEvaluationComplete(undefined, () => {
+            navigateRef.current(`/ai-practice/speaking/results/${testId}`);
+          });
+          
           toastRef.current({
             title: 'Evaluation Complete!',
             description: 'Your speaking test results are ready.',
@@ -149,6 +156,10 @@ export function useSpeakingEvaluationRealtime({
       } else if (job.status === 'failed' && !job.last_error?.includes('Cancelled:')) {
         // Only show failure toast for non-cancelled failures
         const errorMessage = job.last_error || 'Evaluation failed. Please try again.';
+        
+        // Show browser notification for failure
+        notifyEvaluationFailed(errorMessage);
+        
         toastRef.current({
           title: 'Evaluation Failed',
           description: errorMessage,

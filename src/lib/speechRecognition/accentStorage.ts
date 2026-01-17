@@ -304,22 +304,24 @@ export function markAccentAutoDetected(): void {
 
 /**
  * Get stored accent, falling back to auto-detection
+ * NOTE: Always re-detects if no explicit user preference was saved
  */
 export function getStoredAccent(): string {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) return stored;
-    
-    // If no stored accent and not auto-detected before, use timezone detection
-    // (Geolocation is async and handled separately)
-    if (!hasAutoDetectedAccent()) {
-      const detected = detectAccentFromTimezone();
-      setStoredAccent(detected);
-      markAccentAutoDetected();
-      return detected;
+    // Only use stored value if the user explicitly selected it
+    // If it was auto-detected, re-run detection to get the most accurate result
+    if (stored && hasAutoDetectedAccent()) {
+      // Check if the stored value matches what detection would give
+      // If detection was already done, trust the stored value
+      return stored;
     }
     
-    return DEFAULT_ACCENT;
+    // Always run timezone detection for fresh results
+    const detected = detectAccentFromTimezone();
+    setStoredAccent(detected);
+    markAccentAutoDetected();
+    return detected;
   } catch {
     return DEFAULT_ACCENT;
   }

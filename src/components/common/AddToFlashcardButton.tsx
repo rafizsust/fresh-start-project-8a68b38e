@@ -153,6 +153,10 @@ export function AddToFlashcardButton({
 
       if (error) throw error;
 
+      // Invalidate flashcard queries so the decks list refreshes
+      queryClient.invalidateQueries({ queryKey: ['flashcard-decks'] });
+      queryClient.invalidateQueries({ queryKey: ['flashcard-cards'] });
+
       setSaved(true);
       toast.success('Added to flashcards!');
       onSuccess?.();
