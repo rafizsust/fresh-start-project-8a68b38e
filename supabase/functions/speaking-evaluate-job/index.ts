@@ -11,65 +11,42 @@ import {
 } from "../_shared/apiKeyQuotaUtils.ts";
 import { 
   createPerformanceLogger,
-  classifyGeminiErrorStatus
 } from "../_shared/performanceLogger.ts";
+import {
+  decryptKey,
+  parseJson,
+  exponentialBackoffWithJitter,
+  extractRetryAfterSeconds,
+  sleep,
+  calculateBandFromCriteria,
+  computeWeightedPartBand,
+  corsHeaders,
+  QuotaError,
+} from "../_shared/speakingUtils.ts";
 
 /**
  * Speaking Evaluate Job - OPTIMIZED VERSION
  * 
- * This function processes speaking evaluations in PARTS to avoid timeout:
- * 1. Evaluate Part 1 (4-5 short questions) -> save partial results -> update progress (33%)
- * 2. Evaluate Part 2 (1 long response) -> save partial results -> update progress (66%)
- * 3. Evaluate Part 3 (3-4 discussion questions) -> combine all results -> complete (100%)
- * 
- * Each part is evaluated in a separate AI call, allowing the function to survive
- * Supabase's edge function timeout limits.
+ * Uses shared utilities from speakingUtils.ts.
+ * Processes speaking evaluations in PARTS to avoid timeout.
  */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-};
-
 // =============================================================================
-// THE LISTENER - Speaking Evaluation Models (Split-Brain Architecture)
+// Model Priority: Stable native audio models for speech analysis
 // =============================================================================
-// Prioritize stable native audio models for speech analysis
-// These models have proven audio processing capabilities
 const GEMINI_MODELS = [
   'gemini-2.0-flash',                    // 1. Primary: Best Audio Stability
   'gemini-2.0-flash-lite-preview-02-05', // 2. Backup: High Quota Audio
   'gemini-2.5-flash',                    // 3. Last Resort: Standard stable
 ];
-const HEARTBEAT_INTERVAL_MS = 15000; // 15 seconds
+const HEARTBEAT_INTERVAL_MS = 15000;
 const LOCK_DURATION_MINUTES = 5;
-const AI_CALL_TIMEOUT_MS = 90000; // 90 seconds per part (shorter since we're doing smaller chunks)
+const AI_CALL_TIMEOUT_MS = 90000;
 
-// Rate limiting protection - increased delays to prevent hitting RPM limits
-const BASE_RETRY_DELAY_MS = 5000; // Start with 5s delay
-const MAX_RETRY_DELAY_MS = 60000; // Max 60s delay
-const KEY_SWITCH_DELAY_MS = 2000; // 2s delay when switching keys to avoid burst
-
-class QuotaError extends Error {
-  permanent: boolean;
-  constructor(message: string, opts: { permanent: boolean }) {
-    super(message);
-    this.name = 'QuotaError';
-    this.permanent = opts.permanent;
-  }
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function exponentialBackoffWithJitter(attempt: number, baseMs: number, maxMs: number): number {
-  // More aggressive backoff to handle rate limiting
-  const exponential = Math.min(baseMs * Math.pow(2.5, attempt), maxMs);
-  const jitter = Math.random() * exponential * 0.5;
-  return Math.floor(exponential + jitter);
-}
+// Rate limiting delays
+const BASE_RETRY_DELAY_MS = 5000;
+const MAX_RETRY_DELAY_MS = 60000;
+const KEY_SWITCH_DELAY_MS = 2000;
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: number | null = null;
@@ -83,17 +60,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
     if (timer) clearTimeout(timer);
   }
 }
-
-function extractRetryAfterSeconds(err: any): number | undefined {
-  const msg = String(err?.message || err || '');
-  const m1 = msg.match(/retryDelay"\s*:\s*"(\d+)s"/i);
-  if (m1) return Math.max(0, Number(m1[1]));
-  const m2 = msg.match(/retry\s+in\s+([0-9.]+)s/i);
-  if (m2) return Math.max(0, Math.ceil(Number(m2[1])));
-  return undefined;
-}
-
-// Removed isPermanentQuotaExhausted - use isDailyQuotaExhaustedError from shared utils instead
 
 serve(async (req) => {
   console.log(`[speaking-evaluate-job] Request at ${new Date().toISOString()}`);
@@ -760,16 +726,6 @@ serve(async (req) => {
   }
 });
 
-async function decryptKey(encrypted: string, appKey: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const keyData = encoder.encode(appKey).slice(0, 32);
-  const cryptoKey = await crypto.subtle.importKey('raw', keyData, { name: 'AES-GCM' }, false, ['decrypt']);
-  const bytes = Uint8Array.from(atob(encrypted), c => c.charCodeAt(0));
-  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, cryptoKey, bytes.slice(12));
-  return decoder.decode(decrypted);
-}
-
 function buildPartPrompt(
   partNumber: 1 | 2 | 3,
   segments: Array<{ segmentKey: string; partNumber: number; questionNumber: number; questionText: string }>,
@@ -983,17 +939,6 @@ function aggregatePartResults(
     improvement_priorities: [],
     strengths_to_maintain: [],
   };
-}
-
-function parseJson(text: string): any {
-  try {
-    return JSON.parse(text);
-  } catch {}
-  const match = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (match) try { return JSON.parse(match[1].trim()); } catch {}
-  const objMatch = text.match(/\{[\s\S]*\}/);
-  if (objMatch) try { return JSON.parse(objMatch[0]); } catch {}
-  return null;
 }
 
 function calculateBand(result: any): number {

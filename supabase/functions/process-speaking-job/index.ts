@@ -9,113 +9,27 @@ import {
   isDailyQuotaExhaustedError
 } from "../_shared/apiKeyQuotaUtils.ts";
 import { getFromR2 } from "../_shared/r2Client.ts";
+import {
+  decryptKey,
+  uploadToGoogleFileAPI,
+  parseJson,
+  exponentialBackoffWithJitter,
+  extractRetryAfterSeconds,
+  sleep,
+  calculateBandFromCriteria,
+  corsHeaders,
+  QuotaError,
+} from "../_shared/speakingUtils.ts";
 
 /**
- * SEPARATED Speaking Job Processor
+ * SEPARATED Speaking Job Processor (OPTIMIZED)
  * 
+ * Uses shared utilities from speakingUtils.ts.
  * This function ONLY processes jobs - it does NOT create them.
  * Jobs are created by evaluate-speaking-async which returns immediately.
- * 
- * This processor can be called via:
- * 1. Supabase cron job (scheduled polling)
- * 2. Direct invocation from frontend (manual retry)
- * 3. Webhook trigger after job creation
  */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-};
-
-const GEMINI_MODELS = ['gemini-2.5-flash']; // Removed gemini-2.0-flash due to persistent rate limiting
-
-class QuotaError extends Error {
-  permanent: boolean;
-  retryAfterSeconds?: number;
-
-  constructor(message: string, opts: { permanent: boolean; retryAfterSeconds?: number }) {
-    super(message);
-    this.name = 'QuotaError';
-    this.permanent = opts.permanent;
-    this.retryAfterSeconds = opts.retryAfterSeconds;
-  }
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function exponentialBackoffWithJitter(attempt: number, baseDelayMs = 1000, maxDelayMs = 60000): number {
-  const exponentialDelay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
-  const jitter = Math.random() * exponentialDelay * 0.5;
-  return Math.round(exponentialDelay + jitter);
-}
-
-function extractRetryAfterSeconds(err: any): number | undefined {
-  const msg = String(err?.message || err || '');
-  const m1 = msg.match(/retryDelay"\s*:\s*"(\d+)s"/i);
-  if (m1) return Math.max(0, Number(m1[1]));
-  const m2 = msg.match(/retry\s+in\s+([0-9.]+)s/i);
-  if (m2) return Math.max(0, Math.ceil(Number(m2[1])));
-  return undefined;
-}
-
-// Removed isPermanentQuotaExhausted - use isDailyQuotaExhaustedError from shared utils instead
-
-async function uploadToGoogleFileAPI(
-  apiKey: string,
-  audioBytes: Uint8Array,
-  fileName: string,
-  mimeType: string
-): Promise<{ uri: string; mimeType: string }> {
-  console.log(`[process-speaking-job] Uploading ${fileName} to Google File API (${audioBytes.length} bytes)...`);
-  
-  const initiateUrl = `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`;
-  
-  const metadata = { file: { displayName: fileName } };
-  
-  const initiateResponse = await fetch(initiateUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Goog-Upload-Protocol': 'resumable',
-      'X-Goog-Upload-Command': 'start',
-      'X-Goog-Upload-Header-Content-Length': String(audioBytes.length),
-      'X-Goog-Upload-Header-Content-Type': mimeType,
-    },
-    body: JSON.stringify(metadata),
-  });
-  
-  if (!initiateResponse.ok) {
-    const errorText = await initiateResponse.text();
-    throw new Error(`Failed to initiate upload: ${initiateResponse.status} - ${errorText}`);
-  }
-  
-  const uploadUrl = initiateResponse.headers.get('X-Goog-Upload-URL');
-  if (!uploadUrl) throw new Error('No upload URL returned');
-  
-  const uploadResponse = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: {
-      'Content-Length': String(audioBytes.length),
-      'X-Goog-Upload-Offset': '0',
-      'X-Goog-Upload-Command': 'upload, finalize',
-    },
-    body: audioBytes.buffer as ArrayBuffer,
-  });
-  
-  if (!uploadResponse.ok) {
-    const errorText = await uploadResponse.text();
-    throw new Error(`Failed to upload file: ${uploadResponse.status} - ${errorText}`);
-  }
-  
-  const result = await uploadResponse.json();
-  if (!result.file?.uri) throw new Error('No file URI returned');
-  
-  console.log(`[process-speaking-job] Uploaded ${fileName}: ${result.file.uri}`);
-  return { uri: result.file.uri, mimeType: result.file.mimeType || mimeType };
-}
+const GEMINI_MODELS = ['gemini-2.5-flash'];
 
 serve(async (req) => {
   console.log(`[process-speaking-job] Request at ${new Date().toISOString()}`);
@@ -1095,16 +1009,6 @@ FINAL INSTRUCTIONS
 Return ONLY valid JSON. No preamble. No explanation.`;
 }
 
-async function decryptKey(encrypted: string, appKey: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const keyData = encoder.encode(appKey).slice(0, 32);
-  const cryptoKey = await crypto.subtle.importKey('raw', keyData, { name: 'AES-GCM' }, false, ['decrypt']);
-  const bytes = Uint8Array.from(atob(encrypted), c => c.charCodeAt(0));
-  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, cryptoKey, bytes.slice(12));
-  return decoder.decode(decrypted);
-}
-
 function buildPrompt(
   payload: any,
   topic: string | undefined,
@@ -1226,57 +1130,6 @@ EXACT JSON OUTPUT SCHEMA:
 QUESTIONS JSON: ${JSON.stringify(questions)}
 
 REMINDER: There are exactly ${numQ} audio files. Return exactly ${numQ} modelAnswers with correct segment_keys matching the AUDIO_0 to AUDIO_${numQ - 1} mapping above.`;
-}
-
-function parseJson(text: string): any {
-  // First try direct parse
-  try { return JSON.parse(text); } catch {}
-  
-  // Try extracting from markdown code block
-  const match = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (match) try { return JSON.parse(match[1].trim()); } catch {}
-  
-  // Try extracting the largest JSON object
-  const objMatch = text.match(/\{[\s\S]*\}/);
-  if (objMatch) {
-    try { return JSON.parse(objMatch[0]); } catch {}
-    
-    // If that fails, try to repair truncated JSON
-    let jsonStr = objMatch[0];
-    
-    // Count open/close braces to detect truncation
-    const openBraces = (jsonStr.match(/\{/g) || []).length;
-    const closeBraces = (jsonStr.match(/\}/g) || []).length;
-    const openBrackets = (jsonStr.match(/\[/g) || []).length;
-    const closeBrackets = (jsonStr.match(/\]/g) || []).length;
-    
-    // Try to repair by adding missing closing characters
-    if (openBraces > closeBraces || openBrackets > closeBrackets) {
-      console.log(`[parseJson] Attempting JSON repair: braces ${openBraces}/${closeBraces}, brackets ${openBrackets}/${closeBrackets}`);
-      
-      // Remove incomplete trailing content (after last comma or colon)
-      jsonStr = jsonStr.replace(/,\s*"[^"]*"?\s*:?\s*[^,}\]]*$/, '');
-      jsonStr = jsonStr.replace(/,\s*$/, '');
-      
-      // Add missing brackets then braces
-      for (let i = 0; i < openBrackets - closeBrackets; i++) {
-        jsonStr += ']';
-      }
-      for (let i = 0; i < openBraces - closeBraces; i++) {
-        jsonStr += '}';
-      }
-      
-      try { 
-        const repaired = JSON.parse(jsonStr);
-        console.log(`[parseJson] Successfully repaired truncated JSON`);
-        return repaired;
-      } catch (repairErr) {
-        console.warn(`[parseJson] Repair attempt failed: ${repairErr}`);
-      }
-    }
-  }
-  
-  return null;
 }
 
 function calculateBand(result: any): number {
