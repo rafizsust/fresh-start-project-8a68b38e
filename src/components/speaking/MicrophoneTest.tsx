@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
-import { Mic, Play, Pause, StopCircle, Loader2, CheckCircle2, XCircle, Volume2, VolumeX, ArrowLeft, Globe, Info } from 'lucide-react';
+import { Mic, Play, Pause, StopCircle, Loader2, CheckCircle2, XCircle, Volume2, VolumeX, ArrowLeft, Globe, Info, AlertTriangle } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { Slider } from '@/components/ui/slider';
@@ -19,6 +19,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 
 import { detectBrowser, ACCENT_OPTIONS, getStoredAccent, setStoredAccent } from '@/lib/speechRecognition';
 
@@ -45,6 +46,15 @@ async function checkMicrophonePermission(): Promise<'granted' | 'denied' | 'prom
     // Permissions API not supported or failed
   }
   return 'prompt';
+}
+
+// Helper to check if browser TTS is working
+function checkTTSSupport(): { supported: boolean; hasVoices: boolean } {
+  const supported = typeof window !== 'undefined' && 'speechSynthesis' in window;
+  if (!supported) return { supported: false, hasVoices: false };
+  
+  const voices = window.speechSynthesis.getVoices();
+  return { supported: true, hasVoices: voices.length > 0 };
 }
 
 // Optimized audio constraints for better speech recognition accuracy
@@ -75,18 +85,22 @@ export function MicrophoneTest({ onTestComplete, onBack, initialAccent, initialE
   const [duration, setDuration] = useState(0);
   const [micAccessGranted, setMicAccessGranted] = useState(false);
   
-  // Evaluation mode selection - basic (text-based) or accuracy (audio-based)
-  const [evaluationMode, setEvaluationMode] = useState<EvaluationMode>(initialEvaluationMode || 'basic');
+  // TTS support detection
+  const [ttsStatus, setTtsStatus] = useState<{ supported: boolean; hasVoices: boolean }>({ supported: true, hasVoices: true });
+  
+  // Evaluation mode selection - DEFAULT to 'accuracy' (more reliable)
+  const [evaluationMode, setEvaluationMode] = useState<EvaluationMode>(initialEvaluationMode || 'accuracy');
   
   // Accent selection - use stored accent or default based on browser
   const [selectedAccent, setSelectedAccent] = useState<AccentCode>(() => {
     if (initialAccent) return initialAccent;
     // For Edge, accent doesn't matter but we still need a value
-    // For Chrome, use stored preference
+    // For Chrome, use stored preference (which now auto-detects from timezone)
     return getStoredAccent() as AccentCode;
   });
 
   // Check if microphone permission is already granted on mount
+  // Also check TTS support
   useEffect(() => {
     async function checkAndSetPermission() {
       const permissionState = await checkMicrophonePermission();
@@ -106,6 +120,23 @@ export function MicrophoneTest({ onTestComplete, onBack, initialAccent, initialE
         }
       } else {
         setMicAccessGranted(false);
+      }
+      
+      // Check TTS support
+      const tts = checkTTSSupport();
+      setTtsStatus(tts);
+      
+      // If TTS not working, wait for voices to load
+      if (tts.supported && !tts.hasVoices) {
+        const checkVoices = () => {
+          const voices = window.speechSynthesis.getVoices();
+          if (voices.length > 0) {
+            setTtsStatus({ supported: true, hasVoices: true });
+          }
+        };
+        window.speechSynthesis.addEventListener('voiceschanged', checkVoices);
+        // Also try checking after a short delay
+        setTimeout(checkVoices, 500);
       }
       
       setCheckingPermission(false);
@@ -347,6 +378,19 @@ export function MicrophoneTest({ onTestComplete, onBack, initialAccent, initialE
         </p>
       )}
 
+      {/* TTS Not Working Warning */}
+      {evaluationMode === 'basic' && (!ttsStatus.supported || !ttsStatus.hasVoices) && (
+        <Alert variant="destructive" className="text-left">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <strong>Browser Text-to-Speech is not available.</strong>
+            <p className="mt-1 text-xs">
+              The examiner questions will be shown as text. Please read each question carefully and record your spoken response.
+            </p>
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* Evaluation Mode Selection */}
       <div className="bg-muted/50 rounded-lg p-4 space-y-3">
         <div className="flex items-center justify-center gap-2 text-sm font-medium text-foreground">
@@ -359,22 +403,24 @@ export function MicrophoneTest({ onTestComplete, onBack, initialAccent, initialE
           className="grid grid-cols-1 gap-3"
         >
           <div className="flex items-start space-x-3 p-3 rounded-lg border bg-background cursor-pointer hover:bg-muted/30 transition-colors"
-               onClick={() => setEvaluationMode('basic')}>
-            <RadioGroupItem value="basic" id="eval-basic" className="mt-0.5" />
-            <div className="flex-1">
-              <label htmlFor="eval-basic" className="font-medium cursor-pointer">Basic Evaluation</label>
-              <p className="text-xs text-muted-foreground mt-0.5">
-                Uses browser speech recognition for evaluation. Faster and uses less AI tokens.
-              </p>
-            </div>
-          </div>
-          <div className="flex items-start space-x-3 p-3 rounded-lg border bg-background cursor-pointer hover:bg-muted/30 transition-colors"
                onClick={() => setEvaluationMode('accuracy')}>
             <RadioGroupItem value="accuracy" id="eval-accuracy" className="mt-0.5" />
             <div className="flex-1">
               <label htmlFor="eval-accuracy" className="font-medium cursor-pointer">Accuracy Mode</label>
               <p className="text-xs text-muted-foreground mt-0.5">
                 Sends audio directly to AI for evaluation. More accurate but uses more tokens.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-start space-x-3 p-3 rounded-lg border bg-background cursor-pointer hover:bg-muted/30 transition-colors"
+               onClick={() => setEvaluationMode('basic')}>
+            <RadioGroupItem value="basic" id="eval-basic" className="mt-0.5" />
+            <div className="flex-1">
+              <label htmlFor="eval-basic" className="font-medium cursor-pointer">
+                Basic Evaluation <span className="text-xs text-muted-foreground font-normal">(frequent errors)</span>
+              </label>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Uses browser speech recognition for evaluation. Faster and uses less AI tokens.
               </p>
             </div>
           </div>

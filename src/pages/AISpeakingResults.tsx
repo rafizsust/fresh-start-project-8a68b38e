@@ -1137,7 +1137,7 @@ export default function AISpeakingResults() {
                                           </Badge>
                                           <AddToFlashcardButton 
                                             word={upgrade.upgraded} 
-                                            meaning={`Better alternative to "${upgrade.original}"`}
+                                            meaning={`${targetBandLabel} alternative for "${upgrade.original}"`}
                                             example={upgrade.context}
                                             variant="icon"
                                           />

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plus, Loader2, Check, BookOpen } from 'lucide-react';
+import { Plus, Loader2, Check, BookOpen, FolderPlus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { 
   Dialog, 
@@ -21,7 +21,7 @@ import {
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
 import { toast } from 'sonner';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 interface AddToFlashcardButtonProps {
   word?: string;
@@ -41,9 +41,12 @@ export function AddToFlashcardButton({
   onSuccess 
 }: AddToFlashcardButtonProps) {
   const { user } = useAuth();
+  const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [isCreatingDeck, setIsCreatingDeck] = useState(false);
+  const [newDeckName, setNewDeckName] = useState('');
   const [formData, setFormData] = useState({
     word: word,
     meaning: meaning,
@@ -52,7 +55,7 @@ export function AddToFlashcardButton({
   });
 
   // Fetch user's decks
-  const { data: decks = [] } = useQuery({
+  const { data: decks = [], refetch: refetchDecks } = useQuery({
     queryKey: ['flashcard-decks', user?.id],
     queryFn: async () => {
       if (!user) return [];
@@ -66,6 +69,40 @@ export function AddToFlashcardButton({
     },
     enabled: !!user && open
   });
+
+  const handleCreateDeck = async () => {
+    if (!user || !newDeckName.trim()) {
+      toast.error('Please enter a deck name');
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const { data: newDeck, error } = await supabase
+        .from('flashcard_decks')
+        .insert({
+          user_id: user.id,
+          name: newDeckName.trim(),
+          description: 'Custom vocabulary deck'
+        })
+        .select('id')
+        .single();
+
+      if (error) throw error;
+
+      await refetchDecks();
+      queryClient.invalidateQueries({ queryKey: ['flashcard-decks', user.id] });
+      setFormData(prev => ({ ...prev, deckId: newDeck.id }));
+      setNewDeckName('');
+      setIsCreatingDeck(false);
+      toast.success('Deck created!');
+    } catch (error) {
+      console.error('Error creating deck:', error);
+      toast.error('Failed to create deck');
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   const handleSave = async () => {
     if (!user) {
@@ -98,6 +135,7 @@ export function AddToFlashcardButton({
         return;
       }
       deckId = newDeck.id;
+      await refetchDecks();
     }
 
     setIsSaving(true);
@@ -212,26 +250,71 @@ export function AddToFlashcardButton({
             />
           </div>
           
-          {decks.length > 0 && (
-            <div className="space-y-2">
-              <Label htmlFor="deck">Deck</Label>
-              <Select 
-                value={formData.deckId} 
-                onValueChange={(value) => setFormData(prev => ({ ...prev, deckId: value }))}
-              >
-                <SelectTrigger id="deck">
-                  <SelectValue placeholder="Select a deck (or create new)" />
-                </SelectTrigger>
-                <SelectContent>
-                  {decks.map((deck) => (
-                    <SelectItem key={deck.id} value={deck.id}>
-                      {deck.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
+          <div className="space-y-2">
+            <Label htmlFor="deck">Deck</Label>
+            {isCreatingDeck ? (
+              <div className="flex gap-2">
+                <Input
+                  placeholder="New deck name"
+                  value={newDeckName}
+                  onChange={(e) => setNewDeckName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleCreateDeck();
+                    }
+                  }}
+                  autoFocus
+                />
+                <Button 
+                  type="button" 
+                  size="sm" 
+                  onClick={handleCreateDeck}
+                  disabled={isSaving || !newDeckName.trim()}
+                >
+                  {isSaving ? <Loader2 size={14} className="animate-spin" /> : 'Create'}
+                </Button>
+                <Button 
+                  type="button" 
+                  size="sm" 
+                  variant="ghost"
+                  onClick={() => {
+                    setIsCreatingDeck(false);
+                    setNewDeckName('');
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <Select 
+                  value={formData.deckId} 
+                  onValueChange={(value) => setFormData(prev => ({ ...prev, deckId: value }))}
+                >
+                  <SelectTrigger id="deck" className="flex-1">
+                    <SelectValue placeholder={decks.length > 0 ? "Select a deck" : "No decks yet"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {decks.map((deck) => (
+                      <SelectItem key={deck.id} value={deck.id}>
+                        {deck.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button 
+                  type="button" 
+                  size="icon" 
+                  variant="outline"
+                  onClick={() => setIsCreatingDeck(true)}
+                  title="Create new deck"
+                >
+                  <FolderPlus size={16} />
+                </Button>
+              </div>
+            )}
+          </div>
           
           <Button 
             onClick={handleSave} 
