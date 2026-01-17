@@ -128,7 +128,10 @@ export function useBrowserAdaptiveSpeechRecognition(
   // CRITICAL: Append-only segment storage
   const finalSegmentsRef = useRef<string[]>([]);
   const wordIdCounterRef = useRef(0);
-  
+
+  // Track latest interim text so we can flush it on stop/onend (prevents tail cut-offs)
+  const latestInterimRef = useRef('');
+
   // Simple exact-duplicate prevention (only prevents EXACT same segment back-to-back)
   const lastExactFinalRef = useRef('');
   
@@ -294,7 +297,12 @@ export function useBrowserAdaptiveSpeechRecognition(
 
       if (result.isFinal) {
         const trimmed = transcript.trim();
-        
+
+        // If we previously had interim text and now got a final, clear it (final supersedes flush).
+        if (latestInterimRef.current) {
+          latestInterimRef.current = '';
+        }
+
         // ONLY skip if this is EXACTLY the same as the last final (back-to-back duplicate)
         // This prevents the SAME recognition result from being processed twice
         // But ALLOWS the user to intentionally repeat sentences
@@ -302,14 +310,14 @@ export function useBrowserAdaptiveSpeechRecognition(
           console.log('[SpeechRecognition] Skipping exact back-to-back duplicate');
           continue;
         }
-        
+
         if (trimmed.length > 0) {
           // Store as the last exact final for duplicate check
           lastExactFinalRef.current = trimmed;
-          
+
           // APPEND to our segments array - never modify previous segments
           finalSegmentsRef.current.push(trimmed);
-          
+
           // Create word entries
           const finalWords = trimmed.split(/\s+/).filter((w: string) => w.length > 0);
           finalWords.forEach((text: string) => {
@@ -318,14 +326,15 @@ export function useBrowserAdaptiveSpeechRecognition(
               timestamp: Date.now(),
               wordId: wordIdCounterRef.current++,
               isGhost: false,
-              isFiller: false // Simple mode - no filler detection here
+              isFiller: false, // Simple mode - no filler detection here
             });
           });
-          
+
           console.log('[SpeechRecognition] Final segment added:', trimmed.substring(0, 50));
         }
       } else {
         newInterimText = transcript;
+        latestInterimRef.current = transcript;
       }
     }
 
@@ -334,8 +343,9 @@ export function useBrowserAdaptiveSpeechRecognition(
       const fullTranscript = finalSegmentsRef.current.join(' ');
       setFinalTranscript(fullTranscript);
       setRawTranscript(fullTranscript);
-      setWords(prev => [...prev, ...newWords]);
+      setWords((prev) => [...prev, ...newWords]);
     }
+
     setInterimTranscript(newInterimText);
   }, [resetSilenceTimeout]);
 
@@ -377,29 +387,53 @@ export function useBrowserAdaptiveSpeechRecognition(
       isRecording: isRecordingRef.current,
       isManualStop: isManualStopRef.current,
       isRestarting: isRestartingRef.current,
-      segmentCount: finalSegmentsRef.current.length
+      segmentCount: finalSegmentsRef.current.length,
+      hasInterimToFlush: Boolean(latestInterimRef.current?.trim()),
     });
-    
+
+    // Flush latest interim text to avoid losing tail words.
+    // This is intentionally conservative: it may cause minor duplication in rare cases,
+    // but it prevents the more harmful failure mode (missing words at the end/middle).
+    const flushInterimIfAny = () => {
+      const interim = latestInterimRef.current?.trim();
+      if (!interim) return;
+
+      // Avoid flushing if it's an exact duplicate of the last final.
+      if (interim === lastExactFinalRef.current) {
+        latestInterimRef.current = '';
+        return;
+      }
+
+      finalSegmentsRef.current.push(interim);
+      latestInterimRef.current = '';
+
+      const fullTranscript = finalSegmentsRef.current.join(' ');
+      setFinalTranscript(fullTranscript);
+      setRawTranscript(fullTranscript);
+    };
+
+    flushInterimIfAny();
+
     // If user stopped or we're in manual stop mode, don't restart
     if (!isRecordingRef.current || isManualStopRef.current) {
       return;
     }
-    
+
     // If we're in the middle of a planned restart cycle, handle the delayed restart
     if (isRestartingRef.current) {
       // Edge-specific: wait for late results before restarting
       const delay = browser.isEdge ? 300 : RESTART_DELAY_MS;
-      
+
       setTimeout(() => {
         if (!isRecordingRef.current || isManualStopRef.current) {
           isRestartingRef.current = false;
           return;
         }
-        
+
         isRestartingRef.current = false;
         sessionStartRef.current = Date.now();
         lastExactFinalRef.current = ''; // Clear duplicate check for new session
-        
+
         if (recognitionRef.current) {
           try {
             recognitionRef.current.start();
@@ -413,24 +447,24 @@ export function useBrowserAdaptiveSpeechRecognition(
       }, delay);
       return;
     }
-    
+
     // Unexpected end - browser cutoff - restart with delay
     console.log('[SpeechRecognition] Unexpected end detected, scheduling restart...');
     isRestartingRef.current = true;
-    
+
     // Edge-specific: wait for late results
     const delay = browser.isEdge ? 300 : RESTART_DELAY_MS;
-    
+
     setTimeout(() => {
       if (!isRecordingRef.current || isManualStopRef.current) {
         isRestartingRef.current = false;
         return;
       }
-      
+
       isRestartingRef.current = false;
       sessionStartRef.current = Date.now();
       lastExactFinalRef.current = ''; // Clear duplicate check for new session
-      
+
       if (recognitionRef.current) {
         try {
           recognitionRef.current.start();
@@ -564,13 +598,28 @@ export function useBrowserAdaptiveSpeechRecognition(
   // ==================== PUBLIC: stopListening ====================
   const stopListening = useCallback(() => {
     console.log('[SpeechRecognition] Stopping...', {
-      segmentCount: finalSegmentsRef.current.length
+      segmentCount: finalSegmentsRef.current.length,
+      hasInterimToFlush: Boolean(latestInterimRef.current?.trim()),
     });
-    
+
+    // Flush interim BEFORE stopping to avoid losing the tail.
+    const interim = latestInterimRef.current?.trim();
+    if (interim) {
+      // Prefer duplication over missing words.
+      if (interim !== lastExactFinalRef.current) {
+        finalSegmentsRef.current.push(interim);
+        const fullTranscript = finalSegmentsRef.current.join(' ');
+        setFinalTranscript(fullTranscript);
+        setRawTranscript(fullTranscript);
+      }
+      latestInterimRef.current = '';
+      setInterimTranscript('');
+    }
+
     // Set flags FIRST to prevent any restart attempts
     isManualStopRef.current = true;
     isRecordingRef.current = false;
-    
+
     // Clear timers
     if (watchdogTimerRef.current) {
       clearInterval(watchdogTimerRef.current);
@@ -580,7 +629,7 @@ export function useBrowserAdaptiveSpeechRecognition(
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
-    
+
     // Stop recognition gracefully
     if (recognitionRef.current) {
       try {
@@ -589,11 +638,11 @@ export function useBrowserAdaptiveSpeechRecognition(
         // Already stopped
       }
     }
-    
+
     setIsListening(false);
     pauseTrackerRef.current.stop();
     setPauseMetrics(pauseTrackerRef.current.getMetrics());
-    
+
     console.log('[SpeechRecognition] Stopped');
   }, []);
 

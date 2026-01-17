@@ -511,8 +511,25 @@ export default function AISpeakingResults() {
     return 'bg-destructive/20 border-destructive/30';
   };
 
-  // Show async processing state (ONLY if we don't already have a result)
-  if ((loading && !result) || (!result && isWaiting)) {
+  // Initial load: show neutral loading (prevents "Submission Received" flash when opening past results)
+  if (loading && !result) {
+    return (
+      <div className="min-h-screen flex flex-col bg-background">
+        <Navbar />
+        <main className="flex-1 flex items-center justify-center p-4">
+          <Card className="max-w-md w-full">
+            <CardContent className="py-8 text-center">
+              <Loader2 className="w-10 h-10 animate-spin text-primary mx-auto mb-4" />
+              <p className="text-muted-foreground">Loading your speaking evaluation...</p>
+            </CardContent>
+          </Card>
+        </main>
+      </div>
+    );
+  }
+
+  // Async processing state (ONLY when we truly don't have a result yet)
+  if (!result && isWaiting) {
     return (
       <div className="min-h-screen flex flex-col bg-background">
         <Navbar />
@@ -694,8 +711,8 @@ export default function AISpeakingResults() {
             <Alert className="mb-4 md:mb-6 border-warning/50 bg-warning/10">
               <Info className="h-4 w-4 text-warning" />
               <AlertDescription className="text-sm">
-                <strong>Text-Based Evaluation:</strong> This assessment was generated from browser speech recognition transcripts. 
-                Pronunciation scores are estimated from speech recognition patterns, not actual audio analysis. 
+                <strong>Text-Based Evaluation:</strong> This assessment was generated from browser speech recognition transcripts which might often provide wrong transcripts. 
+                Also, pronunciation scores are estimated from speech recognition patterns, not actual audio analysis. 
                 For more accurate pronunciation and fluency assessment, use <strong>Accuracy Mode</strong> which analyzes your actual audio recording.
               </AlertDescription>
             </Alert>

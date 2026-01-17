@@ -76,6 +76,21 @@ interface LexicalUpgrade {
   original: string;
   upgraded: string;
   context: string;
+  type?: 'vocabulary' | 'correction'; // Optional for backward compatibility
+}
+
+interface VocabularyUpgrade {
+  type: 'vocabulary';
+  original: string;
+  upgraded: string;
+  context: string;
+}
+
+interface RecognitionCorrection {
+  type: 'correction';
+  captured: string;
+  intended: string;
+  context: string;
 }
 
 interface PartAnalysis {
@@ -109,6 +124,8 @@ interface EvaluationReport {
   transcripts_by_question?: Record<string, TranscriptEntry[]>; // keyed by part number as string
   modelAnswers?: ModelAnswer[];
   lexical_upgrades?: LexicalUpgrade[];
+  vocabulary_upgrades?: VocabularyUpgrade[];
+  recognition_corrections?: RecognitionCorrection[];
   part_analysis?: PartAnalysis[];
 }
 
@@ -635,63 +652,140 @@ export default function SpeakingEvaluationReport() {
               />
             </TabsContent>
 
-            {/* Lexical Upgrades Tab - matching AI Speaking Results */}
-            <TabsContent value="lexical" className="mt-6">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <ArrowUpRight className="w-5 h-5 text-primary" />
-                    Lexical Upgrade Suggestions
-                  </CardTitle>
-                  <CardDescription>
-                    Replace common words with Band 8+ alternatives
-                  </CardDescription>
-                </CardHeader>
-                <CardContent>
-                  {evaluationReport.lexical_upgrades && evaluationReport.lexical_upgrades.length > 0 ? (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead>
-                          <tr className="border-b">
-                            <th className="text-left py-3 px-2 font-medium">Original Word</th>
-                            <th className="text-left py-3 px-2 font-medium">Band 8+ Alternative</th>
-                            <th className="text-left py-3 px-2 font-medium">Context</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {evaluationReport.lexical_upgrades.map((upgrade, i) => (
-                            <tr key={i} className="border-b last:border-0">
-                              <td className="py-3 px-2">
-                                <Badge variant="outline" className="bg-destructive/10 text-destructive">
-                                  {upgrade.original}
-                                </Badge>
-                              </td>
-                              <td className="py-3 px-2">
-                                <Badge variant="outline" className="bg-success/10 text-success">
-                                  {upgrade.upgraded}
-                                </Badge>
-                              </td>
-                              <td className="py-3 px-2 text-muted-foreground italic">
-                                "{upgrade.context}"
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <div className="text-center py-8 space-y-2">
-                      <CheckCircle2 className="w-12 h-12 text-success mx-auto" />
-                      <p className="text-muted-foreground">
-                        No lexical upgrades suggested - great vocabulary usage!
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        Your vocabulary demonstrates strong Band 7+ language proficiency.
-                      </p>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
+            {/* Lexical Upgrades Tab - NEW FORMAT WITH SEPARATION */}
+            <TabsContent value="lexical" className="mt-6 space-y-4">
+              {/* Helper function for band label */}
+              {(() => {
+                const getTargetBandLabel = () => {
+                  const band = overallBand ?? 0;
+                  if (band >= 7.5) return 'Band 9';
+                  if (band >= 7.0) return 'Band 8+';
+                  if (band >= 6.0) return 'Band 7+';
+                  return 'Band 7+';
+                };
+
+                const recognitionCorrections = evaluationReport.recognition_corrections || [];
+                const vocabularyUpgrades = evaluationReport.vocabulary_upgrades || [];
+                
+                // Legacy format support (if no new arrays, use old)
+                const legacyUpgrades = evaluationReport.lexical_upgrades || [];
+                const hasNewFormat = recognitionCorrections.length > 0 || vocabularyUpgrades.length > 0;
+
+                return (
+                  <>
+                    {/* Recognition Corrections Section */}
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="flex items-center gap-2">
+                          <AlertCircle className="w-5 h-5 text-warning" />
+                          Speech Recognition Corrections
+                        </CardTitle>
+                        <CardDescription>
+                          Words that may have been misheard by speech recognition
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        {recognitionCorrections.length > 0 ? (
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                              <thead>
+                                <tr className="border-b">
+                                  <th className="text-left py-3 px-2 font-medium">What Was Captured</th>
+                                  <th className="text-left py-3 px-2 font-medium">Likely Intended</th>
+                                  <th className="text-left py-3 px-2 font-medium">Context</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {recognitionCorrections.map((correction, i) => (
+                                  <tr key={i} className="border-b last:border-0">
+                                    <td className="py-3 px-2">
+                                      <Badge variant="outline" className="bg-warning/10 text-warning">
+                                        {correction.captured}
+                                      </Badge>
+                                    </td>
+                                    <td className="py-3 px-2">
+                                      <Badge variant="outline" className="bg-primary/10 text-primary">
+                                        {correction.intended}
+                                      </Badge>
+                                    </td>
+                                    <td className="py-3 px-2 text-muted-foreground italic">
+                                      "{correction.context}"
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <div className="text-center py-6 space-y-2">
+                            <CheckCircle2 className="w-10 h-10 text-success mx-auto" />
+                            <p className="text-sm text-muted-foreground">
+                              No recognition errors detected
+                            </p>
+                          </div>
+                        )}
+                      </CardContent>
+                    </Card>
+
+                    {/* Vocabulary Upgrades Section */}
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="flex items-center gap-2">
+                          <ArrowUpRight className="w-5 h-5 text-primary" />
+                          Vocabulary Upgrade Suggestions
+                        </CardTitle>
+                        <CardDescription>
+                          Enhance your vocabulary with higher-band alternatives
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        {(hasNewFormat && vocabularyUpgrades.length > 0) || (!hasNewFormat && legacyUpgrades.length > 0) ? (
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                              <thead>
+                                <tr className="border-b">
+                                  <th className="text-left py-3 px-2 font-medium">Your Word</th>
+                                  <th className="text-left py-3 px-2 font-medium">{getTargetBandLabel()} Alternative</th>
+                                  <th className="text-left py-3 px-2 font-medium">Context</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {(hasNewFormat ? vocabularyUpgrades : legacyUpgrades).map((upgrade, i) => (
+                                  <tr key={i} className="border-b last:border-0">
+                                    <td className="py-3 px-2">
+                                      <Badge variant="outline" className="bg-muted text-foreground">
+                                        {upgrade.original}
+                                      </Badge>
+                                    </td>
+                                    <td className="py-3 px-2">
+                                      <Badge variant="outline" className="bg-success/10 text-success">
+                                        {upgrade.upgraded}
+                                      </Badge>
+                                    </td>
+                                    <td className="py-3 px-2 text-muted-foreground italic">
+                                      "{upgrade.context}"
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <div className="text-center py-6 space-y-2">
+                            <CheckCircle2 className="w-10 h-10 text-success mx-auto" />
+                            <p className="text-sm text-muted-foreground">
+                              No vocabulary upgrades suggested - excellent word choice!
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              Your vocabulary demonstrates strong {getTargetBandLabel()} language proficiency.
+                            </p>
+                          </div>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </>
+                );
+              })()}
             </TabsContent>
 
             {/* Part-by-Part Analysis Tab */}
