@@ -115,6 +115,10 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
   // Simple exact-duplicate prevention
   const lastExactFinalRef = useRef('');
 
+  // CRITICAL: Track latest interim text for flushing on restart/stop
+  // This prevents word loss when Chrome's watchdog triggers a restart
+  const latestInterimRef = useRef('');
+
   // Timing
   const sessionStartRef = useRef(0);
 
@@ -173,6 +177,11 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
       if (result.isFinal) {
         const trimmed = text.trim();
         
+        // Clear interim since we got a final (final supersedes any buffered interim)
+        if (latestInterimRef.current) {
+          latestInterimRef.current = '';
+        }
+        
         // Only skip if this is EXACTLY the same as the last final (back-to-back duplicate)
         if (trimmed === lastExactFinalRef.current) {
           console.log('[SpeechAnalysis] Skipping exact back-to-back duplicate');
@@ -186,6 +195,8 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
         }
       } else {
         interimText += text;
+        // CRITICAL: Track latest interim for flushing on restart/stop
+        latestInterimRef.current = text;
       }
     }
 
@@ -214,6 +225,33 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
   }, [options]);
 
   /**
+   * CRITICAL: Flush any buffered interim text to final segments
+   * This prevents word loss when Chrome's watchdog triggers a restart
+   */
+  const flushInterimToFinal = useCallback(() => {
+    const interim = latestInterimRef.current?.trim();
+    if (!interim) return false;
+
+    // Don't flush if it's exactly the same as last final (prevents duplicates)
+    if (interim === lastExactFinalRef.current) {
+      latestInterimRef.current = '';
+      return false;
+    }
+
+    console.log('[SpeechAnalysis] Flushing interim to final:', interim.substring(0, 60));
+    finalSegmentsRef.current.push(interim);
+    lastExactFinalRef.current = interim;
+    latestInterimRef.current = '';
+
+    // Update displayed transcript
+    const fullTranscript = finalSegmentsRef.current.join(' ');
+    setInterimTranscript(fullTranscript);
+    options.onInterimResult?.(fullTranscript);
+
+    return true;
+  }, [options]);
+
+  /**
    * Handle recognition end with SAFE restart
    */
   const handleEnd = useCallback(() => {
@@ -226,7 +264,12 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
       isManualStop: isManualStopRef.current,
       isRestarting: isRestartingRef.current,
       segmentCount: finalSegmentsRef.current.length,
+      hasInterimToFlush: Boolean(latestInterimRef.current?.trim()),
     });
+
+    // CRITICAL: Flush any pending interim text BEFORE checking restart conditions
+    // This prevents word loss at segment boundaries
+    flushInterimToFinal();
 
     if (!isAnalyzingRef.current || isManualStopRef.current) return;
 
@@ -240,6 +283,7 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
 
       sessionStartRef.current = Date.now();
       isRestartingRef.current = false;
+      // Clear duplicate check for new session to prevent false positives
       lastExactFinalRef.current = '';
 
       try {
@@ -250,7 +294,7 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
         consecutiveFailuresRef.current++;
       }
     }, delay);
-  }, []);
+  }, [flushInterimToFinal]);
 
   /**
    * Setup event handlers for the single recognition instance
@@ -280,6 +324,10 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
       if (elapsed > maxSessionMs) {
         console.log(`[SpeechAnalysis] Watchdog: proactive restart after ${Math.round(elapsed / 1000)}s`);
         isRestartingRef.current = true;
+        
+        // CRITICAL: Flush interim BEFORE stopping to prevent word loss
+        flushInterimToFinal();
+        
         try {
           recognitionRef.current?.stop();
         } catch {
@@ -287,7 +335,7 @@ export function useAdvancedSpeechAnalysis(options: UseAdvancedSpeechAnalysisOpti
         }
       }
     }, WATCHDOG_INTERVAL_MS);
-  }, []);
+  }, [flushInterimToFinal]);
 
   const stopWatchdog = useCallback(() => {
     if (watchdogTimerRef.current) {
