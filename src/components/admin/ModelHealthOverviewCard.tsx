@@ -29,7 +29,6 @@ const GEMINI_MODELS = [
   { id: 'gemini-2.5-flash-preview-tts', displayName: '2.5 Flash TTS', description: 'Audio generation' },
   { id: 'gemini-2.5-pro', displayName: '2.5 Pro', description: 'Writing evaluation' },
   { id: 'gemini-3-pro-preview', displayName: '3 Pro', description: 'Writing primary' },
-  { id: 'gemini-exp-1206', displayName: 'Exp 1206', description: 'Test generation' },
 ];
 
 interface ModelHealthData {
@@ -123,7 +122,6 @@ const MODEL_TO_DB_COLUMN: Record<string, string> = {
   'gemini-2.5-flash-preview-tts': 'gemini_2_5_flash_tts',
   'gemini-2.5-pro': 'gemini_2_5_pro',
   'gemini-3-pro-preview': 'gemini_3_pro',
-  'gemini-exp-1206': 'gemini_exp_1206',
 };
 
 export default function ModelHealthOverviewCard() {

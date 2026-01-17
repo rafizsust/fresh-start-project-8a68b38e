@@ -244,9 +244,7 @@ CRITICAL - VOICE-GENDER SYNCHRONIZATION:
 // Prioritize instruction-following models for complex JSON generation
 // These models excel at adhering to strict formatting rules and producing valid JSON
 const GEMINI_MODELS = [
-  'gemini-exp-1206',      // 1. Primary: Best adherence to complex JSON rules (Free Pro class)
-  'gemini-2.0-flash-exp', // 2. Secondary: Strong reasoning, experimental
-  'gemini-2.5-flash',     // 3. Fallback: Standard stable model
+  'gemini-2.5-flash',     // 1. Primary: Stable, reliable for complex JSON generation
 ];
 
 // Store last error for better error messages

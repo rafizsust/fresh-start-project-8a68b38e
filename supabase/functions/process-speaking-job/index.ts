@@ -992,12 +992,13 @@ Also include combined "lexical_upgrades" array for backward compatibility.
 ADAPTIVE MODEL ANSWERS
 ═══════════════════════════════════════════════════════════════════════════════
 
-For each modelAnswer:
-- "estimatedBand": The band score for THIS specific response
-- "targetBand": ONE band level above estimatedBand (e.g., if estimatedBand is 5.5, targetBand is 6.5)
-- "modelAnswer": A response that demonstrates the TARGET band level (not always Band 8+)
+CRITICAL - UNIFIED TARGET BAND FOR ALL MODEL ANSWERS:
+1. Find the HIGHEST band score among all 4 criteria (FC, LR, GRA, P)
+2. Set targetBand = highest_criteria_score + 1 (max 9)
+3. ALL modelAnswers must use the SAME targetBand
 
-This makes model answers more achievable and relevant to the candidate's current level.
+Example: If criteria are FC=6, LR=6, GRA=5.5, P=6 → highest=6 → targetBand=7 for ALL answers
+This ensures model answers show the next achievable level based on user's best performance.
 
 ═══════════════════════════════════════════════════════════════════════════════
 FINAL INSTRUCTIONS
